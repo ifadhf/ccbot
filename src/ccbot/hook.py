@@ -131,6 +131,152 @@ def _install_hook() -> int:
     return 0
 
 
+def _get_tmux_window() -> tuple[str, str, str] | None:
+    """Resolve the tmux (session_name, window_id, window_name) for this pane.
+
+    Returns None when not running inside tmux or resolution fails.
+    """
+    pane_id = os.environ.get("TMUX_PANE", "")
+    if not pane_id:
+        logger.debug("TMUX_PANE not set, not inside tmux")
+        return None
+
+    result = subprocess.run(
+        [
+            "tmux",
+            "display-message",
+            "-t",
+            pane_id,
+            "-p",
+            "#{session_name}:#{window_id}:#{window_name}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    raw_output = result.stdout.strip()
+    parts = raw_output.split(":", 2)
+    if len(parts) < 3:
+        logger.warning(
+            "Failed to parse session:window_id:window_name from tmux (pane=%s, output=%s)",
+            pane_id,
+            raw_output,
+        )
+        return None
+    return parts[0], parts[1], parts[2]
+
+
+# Minimum seconds between identical event notifications per window
+_NOTIFY_DEBOUNCE_SECS = 5.0
+
+
+def _read_bot_token(ccbot_dir_path: Path) -> str:
+    """Read TELEGRAM_BOT_TOKEN from env or <ccbot_dir>/.env (no config import)."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if token:
+        return token
+    env_file = ccbot_dir_path / ".env"
+    try:
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("TELEGRAM_BOT_TOKEN="):
+                return line.split("=", 1)[1].strip().strip("'\"")
+    except OSError:
+        pass
+    return ""
+
+
+def _notify_telegram(event: str, payload: dict) -> None:
+    """Send a direct Telegram notification for Stop/Notification hook events.
+
+    Resolves this pane's window to its bound Telegram topic via state.json,
+    then calls sendMessage over HTTPS. Silent no-op when the window is not
+    bound to any topic (e.g. Claude sessions outside ccbot).
+    """
+    import time
+    import urllib.parse
+    import urllib.request
+
+    from .utils import atomic_write_json, ccbot_dir
+
+    window = _get_tmux_window()
+    if window is None:
+        return
+    _, window_id, _ = window
+
+    cfg_dir = ccbot_dir()
+
+    # Find the thread binding for this window
+    state_file = cfg_dir / "state.json"
+    try:
+        state = json.loads(state_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        logger.debug("No readable state.json, skipping notification")
+        return
+
+    thread_bindings: dict = state.get("thread_bindings", {})
+    group_chat_ids: dict = state.get("group_chat_ids", {})
+    target: tuple[int, int] | None = None  # (chat_id, thread_id)
+    for user_id, bindings in thread_bindings.items():
+        for thread_id, wid in bindings.items():
+            if wid == window_id:
+                chat_id = group_chat_ids.get(f"{user_id}:{thread_id}")
+                if chat_id:
+                    target = (int(chat_id), int(thread_id))
+                break
+    if target is None:
+        logger.debug("Window %s not bound to a topic, skipping", window_id)
+        return
+    chat_id, thread_id = target
+
+    # Debounce identical event notifications per window
+    debounce_file = cfg_dir / "notify_debounce.json"
+    now = time.time()
+    key = f"{window_id}:{event}"
+    try:
+        debounce = json.loads(debounce_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        debounce = {}
+    last = float(debounce.get(key, 0))
+    if now - last < _NOTIFY_DEBOUNCE_SECS:
+        logger.debug("Debounced %s (%.1fs since last)", key, now - last)
+        return
+    debounce[key] = now
+    # Drop stale entries so the file doesn't grow forever
+    debounce = {k: v for k, v in debounce.items() if now - float(v) < 3600}
+    try:
+        atomic_write_json(debounce_file, debounce)
+    except OSError:
+        pass
+
+    if event == "Stop":
+        text = "✅ Task selesai — menunggu input"
+    else:  # Notification
+        detail = payload.get("message") or "Claude needs your attention"
+        text = f"🔔 {detail}"
+
+    token = _read_bot_token(cfg_dir)
+    if not token:
+        logger.warning("No TELEGRAM_BOT_TOKEN available, cannot notify")
+        return
+
+    data = urllib.parse.urlencode(
+        {
+            "chat_id": chat_id,
+            "message_thread_id": thread_id,
+            "text": text,
+            "disable_notification": "false",
+        }
+    ).encode()
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, data=data), timeout=6
+        ) as resp:
+            logger.info("Sent %s notification (HTTP %s)", event, resp.status)
+    except Exception as e:
+        logger.warning("Failed to send %s notification: %s", event, e)
+
+
 def hook_main() -> None:
     """Process a Claude Code hook event from stdin, or install the hook."""
     # Configure logging for the hook subprocess (main.py logging doesn't apply here)
@@ -182,40 +328,21 @@ def hook_main() -> None:
         logger.warning("cwd is not absolute: %s", cwd)
         return
 
+    if event in ("Stop", "Notification"):
+        _notify_telegram(event, payload)
+        return
+
     if event != "SessionStart":
-        logger.debug("Ignoring non-SessionStart event: %s", event)
+        logger.debug("Ignoring unsupported event: %s", event)
         return
 
     # Get tmux session:window key for the pane running this hook.
     # TMUX_PANE is set by tmux for every process inside a pane.
-    pane_id = os.environ.get("TMUX_PANE", "")
-    if not pane_id:
-        logger.warning("TMUX_PANE not set, cannot determine window")
+    window = _get_tmux_window()
+    if window is None:
+        logger.warning("Cannot determine tmux window")
         return
-
-    result = subprocess.run(
-        [
-            "tmux",
-            "display-message",
-            "-t",
-            pane_id,
-            "-p",
-            "#{session_name}:#{window_id}:#{window_name}",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    raw_output = result.stdout.strip()
-    # Expected format: "session_name:@id:window_name"
-    parts = raw_output.split(":", 2)
-    if len(parts) < 3:
-        logger.warning(
-            "Failed to parse session:window_id:window_name from tmux (pane=%s, output=%s)",
-            pane_id,
-            raw_output,
-        )
-        return
-    tmux_session_name, window_id, window_name = parts
+    tmux_session_name, window_id, window_name = window
     # Key uses window_id for uniqueness
     session_window_key = f"{tmux_session_name}:{window_id}"
 
