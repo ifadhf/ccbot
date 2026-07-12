@@ -354,8 +354,8 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 def _parse_permission_mode(pane_text: str) -> str:
     """Detect Claude Code's permission mode from the pane footer."""
     tail = "\n".join(pane_text.split("\n")[-15:]).lower()
-    if "accept edits on" in tail:
-        return "⏵⏵ accept edits (auto)"
+    if "auto mode on" in tail or "accept edits on" in tail:
+        return "⏵⏵ auto (accept edits)"
     if "plan mode on" in tail:
         return "⏸ plan mode"
     if "bypass permissions on" in tail:
