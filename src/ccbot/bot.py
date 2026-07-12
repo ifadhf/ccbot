@@ -352,15 +352,24 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 def _parse_permission_mode(pane_text: str) -> str:
-    """Detect Claude Code's permission mode from the pane footer."""
-    tail = "\n".join(pane_text.split("\n")[-15:]).lower()
-    if "auto mode on" in tail or "accept edits on" in tail:
-        return "⏵⏵ auto (accept edits)"
-    if "plan mode on" in tail:
-        return "⏸ plan mode"
-    if "bypass permissions on" in tail:
-        return "⚠️ bypass permissions"
-    return "normal (default)"
+    """Detect Claude Code's permission mode from the pane footer.
+
+    Scans bottom-up: the lowest indicator line is the live footer; matching
+    text higher up may be stale TUI redraw leftovers in the transcript area.
+    """
+    for line in reversed(pane_text.split("\n")):
+        low = line.lower()
+        if "bypass permissions on" in low:
+            return "⚠️ bypass permissions"
+        if "plan mode on" in low:
+            return "⏸ plan mode"
+        if "auto mode on" in low:
+            return "⏵⏵ auto"
+        if "accept edits on" in low:
+            return "⏵⏵ accept edits"
+        if "manual mode on" in low:
+            return "✋ manual (default)"
+    return "unknown (no mode indicator visible)"
 
 
 async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
