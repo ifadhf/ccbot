@@ -351,6 +351,49 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await safe_reply(update.message, "⎋ Sent Escape")
 
 
+def _parse_permission_mode(pane_text: str) -> str:
+    """Detect Claude Code's permission mode from the pane footer."""
+    tail = "\n".join(pane_text.split("\n")[-15:]).lower()
+    if "accept edits on" in tail:
+        return "⏵⏵ accept edits (auto)"
+    if "plan mode on" in tail:
+        return "⏸ plan mode"
+    if "bypass permissions on" in tail:
+        return "⚠️ bypass permissions"
+    return "normal (default)"
+
+
+async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cycle Claude Code permission mode (Shift+Tab) and report the result."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        await safe_reply(update.message, f"❌ Window '{display}' no longer exists.")
+        return
+
+    # Shift+Tab cycles: normal → accept edits → plan → normal
+    await tmux_manager.send_keys(w.window_id, "BTab", enter=False, literal=False)
+    await asyncio.sleep(0.7)
+    pane_text = await tmux_manager.capture_pane(w.window_id)
+    mode = _parse_permission_mode(pane_text or "")
+    await safe_reply(
+        update.message,
+        f"⇧⇥ Mode: *{mode}*\nSend /mode again to cycle to the next mode.",
+    )
+
+
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Fetch Claude Code usage stats from TUI and send to Telegram."""
     user = update.effective_user
@@ -410,6 +453,7 @@ _KEYS_SEND_MAP: dict[str, tuple[str, bool, bool]] = {
     "ent": ("Enter", False, False),
     "spc": ("Space", False, False),
     "tab": ("Tab", False, False),
+    "btab": ("BTab", False, False),
     "cc": ("C-c", False, False),
 }
 
@@ -423,6 +467,7 @@ _KEY_LABELS: dict[str, str] = {
     "ent": "⏎ Enter",
     "spc": "␣ Space",
     "tab": "⇥ Tab",
+    "btab": "⇧⇥ Mode",
     "cc": "^C",
 }
 
@@ -441,6 +486,7 @@ def _build_screenshot_keyboard(window_id: str) -> InlineKeyboardMarkup:
             [btn("␣ Space", "spc"), btn("↑", "up"), btn("⇥ Tab", "tab")],
             [btn("←", "lt"), btn("↓", "dn"), btn("→", "rt")],
             [btn("⎋ Esc", "esc"), btn("^C", "cc"), btn("⏎ Enter", "ent")],
+            [btn("⇧⇥ Mode", "btab")],
             [
                 InlineKeyboardButton(
                     "🔄 Refresh",
@@ -1888,6 +1934,7 @@ async def post_init(application: Application) -> None:
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
         BotCommand("kill", "Kill session and delete topic"),
+        BotCommand("mode", "Cycle permission mode (Shift+Tab)"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
         BotCommand("usage", "Show Claude Code usage remaining"),
     ]
@@ -1964,6 +2011,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("kill", kill_command))
+    application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
