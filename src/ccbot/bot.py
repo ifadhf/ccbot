@@ -41,6 +41,7 @@ from pathlib import Path
 from telegram import (
     Bot,
     BotCommand,
+    BotCommandScopeAllGroupChats,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaDocument,
@@ -1952,6 +1953,11 @@ async def post_init(application: Application) -> None:
         bot_commands.append(BotCommand(cmd_name, desc))
 
     await application.bot.set_my_commands(bot_commands)
+    # Also register under the group-chats scope: group clients check this
+    # scope first and may not fall back to default until their cache expires
+    await application.bot.set_my_commands(
+        bot_commands, scope=BotCommandScopeAllGroupChats()
+    )
 
     # Re-resolve stale window IDs from persisted state against live tmux windows
     await session_manager.resolve_stale_ids()
