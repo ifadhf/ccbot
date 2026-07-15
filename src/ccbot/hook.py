@@ -185,6 +185,39 @@ def _read_bot_token(ccbot_dir_path: Path) -> str:
     return ""
 
 
+def _get_user_mention(user_id: str, token: str, cfg_dir: Path) -> str:
+    """Return an HTML mention for user_id, e.g. '<a href="tg://user?id=...">@name</a>'.
+
+    Resolves username/first_name via Bot API getChat once and caches it
+    (usernames rarely change) to avoid an extra HTTP round-trip per notify.
+    """
+    import urllib.request
+
+    cache_file = cfg_dir / "user_cache.json"
+    try:
+        cache = json.loads(cache_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        cache = {}
+
+    label = cache.get(user_id)
+    if not label:
+        try:
+            url = f"https://api.telegram.org/bot{token}/getChat?chat_id={user_id}"
+            with urllib.request.urlopen(url, timeout=6) as resp:
+                result = json.load(resp).get("result", {})
+            username = result.get("username")
+            label = f"@{username}" if username else result.get("first_name", "you")
+            cache[user_id] = label
+            from .utils import atomic_write_json
+
+            atomic_write_json(cache_file, cache)
+        except Exception as e:
+            logger.debug("getChat failed for user %s: %s", user_id, e)
+            label = "you"
+
+    return f'<a href="tg://user?id={user_id}">{label}</a>'
+
+
 def _notify_telegram(event: str, payload: dict) -> None:
     """Send a direct Telegram notification for Stop/Notification hook events.
 
@@ -215,18 +248,18 @@ def _notify_telegram(event: str, payload: dict) -> None:
 
     thread_bindings: dict = state.get("thread_bindings", {})
     group_chat_ids: dict = state.get("group_chat_ids", {})
-    target: tuple[int, int] | None = None  # (chat_id, thread_id)
-    for user_id, bindings in thread_bindings.items():
+    target: tuple[int, int, str] | None = None  # (chat_id, thread_id, user_id)
+    for uid, bindings in thread_bindings.items():
         for thread_id, wid in bindings.items():
             if wid == window_id:
-                chat_id = group_chat_ids.get(f"{user_id}:{thread_id}")
+                chat_id = group_chat_ids.get(f"{uid}:{thread_id}")
                 if chat_id:
-                    target = (int(chat_id), int(thread_id))
+                    target = (int(chat_id), int(thread_id), uid)
                 break
     if target is None:
         logger.debug("Window %s not bound to a topic, skipping", window_id)
         return
-    chat_id, thread_id = target
+    chat_id, thread_id, user_id = target
 
     # Debounce identical event notifications per window
     debounce_file = cfg_dir / "notify_debounce.json"
@@ -248,22 +281,26 @@ def _notify_telegram(event: str, payload: dict) -> None:
     except OSError:
         pass
 
-    if event == "Stop":
-        text = "✅ Task selesai — menunggu input"
-    else:  # Notification
-        detail = payload.get("message") or "Claude needs your attention"
-        text = f"🔔 {detail}"
-
     token = _read_bot_token(cfg_dir)
     if not token:
         logger.warning("No TELEGRAM_BOT_TOKEN available, cannot notify")
         return
+
+    mention = _get_user_mention(user_id, token, cfg_dir)
+    if event == "Stop":
+        text = f"✅ Task selesai — menunggu input {mention}"
+    else:  # Notification
+        import html
+
+        detail = html.escape(payload.get("message") or "Claude needs your attention")
+        text = f"🔔 {detail} — {mention}"
 
     data = urllib.parse.urlencode(
         {
             "chat_id": chat_id,
             "message_thread_id": thread_id,
             "text": text,
+            "parse_mode": "HTML",
             "disable_notification": "false",
         }
     ).encode()
