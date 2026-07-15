@@ -299,10 +299,10 @@ def _notify_telegram(event: str, payload: dict) -> None:
     if event == "Stop":
         text = f"✅ Task selesai — menunggu input {mention}"
     else:  # Notification
-        import html
-
-        detail = html.escape(payload.get("message") or "Claude needs your attention")
-        text = f"🔔 {detail} — {mention}"
+        # Always generic: the real payload message (e.g. "Claude needs your
+        # permission") is misleading for non-risky prompts like AskUserQuestion,
+        # which also fires notification_type=permission_prompt.
+        text = f"🔔 Claude needs your attention — {mention}"
 
     data = urllib.parse.urlencode(
         {
@@ -360,15 +360,16 @@ def hook_main() -> None:
     cwd = payload.get("cwd", "")
     event = payload.get("hook_event_name", "")
 
-    # TEMPORARY: capture raw Notification payloads for schema investigation.
-    # Remove once we've confirmed the real field names/values.
-    if event == "Notification":
+    # TEMPORARY: capture raw Stop payloads to check whether Stop fires for
+    # subagent (Task) completions too, or only for the main turn.
+    # Remove once confirmed.
+    if event == "Stop":
         try:
             import time as _time
 
             from .utils import ccbot_dir as _ccbot_dir
 
-            dump_file = _ccbot_dir() / "notification_payload_samples.jsonl"
+            dump_file = _ccbot_dir() / "stop_payload_samples.jsonl"
             with open(dump_file, "a") as f:
                 f.write(json.dumps({"captured_at": _time.time(), "payload": payload}) + "\n")
         except OSError:
