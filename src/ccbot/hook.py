@@ -360,6 +360,20 @@ def hook_main() -> None:
     cwd = payload.get("cwd", "")
     event = payload.get("hook_event_name", "")
 
+    # TEMPORARY: capture raw Notification payloads for schema investigation.
+    # Remove once we've confirmed the real field names/values.
+    if event == "Notification":
+        try:
+            import time as _time
+
+            from .utils import ccbot_dir as _ccbot_dir
+
+            dump_file = _ccbot_dir() / "notification_payload_samples.jsonl"
+            with open(dump_file, "a") as f:
+                f.write(json.dumps({"captured_at": _time.time(), "payload": payload}) + "\n")
+        except OSError:
+            pass
+
     if not session_id or not event:
         logger.debug("Empty session_id or event, ignoring")
         return
