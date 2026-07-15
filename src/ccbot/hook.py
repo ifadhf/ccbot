@@ -231,6 +231,15 @@ def _notify_telegram(event: str, payload: dict) -> None:
 
     from .utils import atomic_write_json, ccbot_dir
 
+    if event == "Notification":
+        # This variant just re-announces the idle state Stop already sent
+        # ~60s earlier ("Claude is waiting for your input") — skip it.
+        # Other Notification kinds (e.g. permission requests) still fire.
+        msg = (payload.get("message") or "").lower()
+        if "waiting for your input" in msg or "waiting for input" in msg:
+            logger.debug("Skipping idle-nudge Notification (redundant with Stop)")
+            return
+
     window = _get_tmux_window()
     if window is None:
         return
