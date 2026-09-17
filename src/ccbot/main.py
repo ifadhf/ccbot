@@ -13,6 +13,11 @@ import sys
 def main() -> None:
     """Main entry point."""
     if len(sys.argv) > 1:
+        if sys.argv[1] in ("files", "send-file"):
+            from .file_transfer import file_main
+
+            file_main()
+            return
         if sys.argv[1] == "hook":
             from .hook import hook_main
 
@@ -21,7 +26,7 @@ def main() -> None:
         # Reject anything else: silently falling through to "start the bot"
         # means a typo (or `ccbot --help`) launches a second bot instance
         # that races the real one for Telegram updates.
-        usage = "Usage: ccbot        start the Telegram bot\n       ccbot hook   run as Claude Code SessionStart hook"
+        usage = "Usage: ccbot        start the Telegram bot\n       ccbot hook   run Claude Code hooks\n       ccbot files   show this topic's inbox/outbox\n       ccbot send-file PATH [--caption TEXT]   upload to this topic"
         if sys.argv[1] in ("-h", "--help"):
             print(usage)
             return

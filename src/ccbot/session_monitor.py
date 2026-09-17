@@ -101,10 +101,19 @@ class SessionMonitor:
                 cwds.add(w.cwd)
         return cwds
 
-    async def scan_projects(self) -> list[SessionInfo]:
-        """Scan projects that have active tmux windows."""
+    async def scan_projects(
+        self, known_session_ids: set[str] | None = None
+    ) -> list[SessionInfo]:
+        """Scan projects that have active tmux windows.
+
+        known_session_ids bypasses the cwd match: sessions already bound to
+        a live window via session_map.json stay scanned even if the tmux
+        pane's cwd has since diverged from the cwd recorded in the
+        transcript (e.g. the project directory was renamed mid-session).
+        """
+        known_session_ids = known_session_ids or set()
         active_cwds = await self._get_active_cwds()
-        if not active_cwds:
+        if not active_cwds and not known_session_ids:
             return []
 
         sessions = []
@@ -140,7 +149,10 @@ class SessionMonitor:
                             norm_pp = str(Path(project_path).resolve())
                         except (OSError, ValueError):
                             norm_pp = project_path
-                        if norm_pp not in active_cwds:
+                        if (
+                            session_id not in known_session_ids
+                            and norm_pp not in active_cwds
+                        ):
                             continue
 
                         indexed_ids.add(session_id)
@@ -179,7 +191,10 @@ class SessionMonitor:
                     except (OSError, ValueError):
                         norm_fp = file_project_path
 
-                    if norm_fp not in active_cwds:
+                    if (
+                        session_id not in known_session_ids
+                        and norm_fp not in active_cwds
+                    ):
                         continue
 
                     sessions.append(
@@ -290,7 +305,7 @@ class SessionMonitor:
         new_messages = []
 
         # Scan projects to get available session files
-        sessions = await self.scan_projects()
+        sessions = await self.scan_projects(known_session_ids=active_session_ids)
 
         # Only process sessions that are in session_map
         for session_info in sessions:
@@ -362,6 +377,9 @@ class SessionMonitor:
                         continue
                     # Skip user messages unless show_user_messages is enabled
                     if entry.role == "user" and not config.show_user_messages:
+                        continue
+                    # Skip thinking content unless show_thinking is enabled
+                    if entry.content_type == "thinking" and not config.show_thinking:
                         continue
                     new_messages.append(
                         NewMessage(
