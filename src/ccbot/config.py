@@ -57,12 +57,32 @@ class Config:
                 "Expected comma-separated Telegram user IDs."
             ) from e
 
+        # Group topics can be shared by all allowed users. Authorization still
+        # uses the sender's user ID; session and delivery state use the chat ID.
+        self.chat_scoped_topics = (
+            os.getenv("CCBOT_CHAT_SCOPED_TOPICS", "false").lower() == "true"
+        )
+        self.topic_owner_lock = (
+            os.getenv("CCBOT_TOPIC_OWNER_LOCK", "false").lower() == "true"
+        )
+
         # Tmux session name and window naming
         self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
         self.tmux_main_window_name = "__main__"
 
         # Claude command to run in new windows
         self.claude_command = os.getenv("CLAUDE_COMMAND", "claude")
+
+        # Optional fixed starting directory for new topics; blank keeps pickers.
+        self.fixed_workdir: Path | None = None
+        fixed_workdir = os.getenv("CCBOT_FIXED_WORKDIR", "").strip()
+        if fixed_workdir:
+            path = Path(fixed_workdir).expanduser()
+            if not path.is_absolute() or not path.is_dir():
+                raise ValueError(
+                    "CCBOT_FIXED_WORKDIR must be an existing absolute directory"
+                )
+            self.fixed_workdir = path.resolve()
 
         # All state files live under config_dir
         self.state_file = self.config_dir / "state.json"
@@ -98,9 +118,7 @@ class Config:
 
         # Show thinking content notifications in Telegram
         # When False, thinking blocks are not sent as real-time messages
-        self.show_thinking = (
-            os.getenv("CCBOT_SHOW_THINKING", "true").lower() != "false"
-        )
+        self.show_thinking = os.getenv("CCBOT_SHOW_THINKING", "true").lower() != "false"
 
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (
