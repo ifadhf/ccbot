@@ -119,6 +119,8 @@ def _inspect_queue(queue: asyncio.Queue[MessageTask]) -> list[MessageTask]:
 
 def _can_merge_tasks(base: MessageTask, candidate: MessageTask) -> bool:
     """Check if two content tasks can be merged."""
+    if base.thread_id != candidate.thread_id:
+        return False
     if base.window_id != candidate.window_id:
         return False
     if candidate.task_type != "content":

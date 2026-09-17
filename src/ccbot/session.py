@@ -26,9 +26,9 @@ import fcntl
 import json
 import logging
 import re
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from collections.abc import Callable, Iterator
 from typing import Any
 
 import aiofiles
@@ -92,7 +92,9 @@ class SessionManager:
 
     window_states: window_id -> WindowState (session_id, cwd, window_name)
     user_window_offsets: user_id -> {window_id -> byte_offset}
-    thread_bindings: user_id -> {thread_id -> window_id}
+    thread_bindings: routing_id -> {thread_id -> window_id}
+      routing_id is chat_id when CCBOT_CHAT_SCOPED_TOPICS is enabled; the
+      user_id parameter names are retained for compatibility with callers.
     window_display_names: window_id -> window_name (for display)
     group_chat_ids: "user_id:thread_id" -> group chat_id (for supergroup routing)
     """
@@ -111,12 +113,15 @@ class SessionManager:
     # History: originally added in 5afc111, erroneously removed in 26cb81f,
     # restored in PR #23.
     group_chat_ids: dict[str, int] = field(default_factory=dict)
+    # "chat_id:thread_id" -> owner identity; independent of tmux lifecycle.
+    topic_owners: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._load_state()
 
     def _save_state(self) -> None:
         state: dict[str, Any] = {
+            "routing_scope": "chat" if config.chat_scoped_topics else "user",
             "window_states": {k: v.to_dict() for k, v in self.window_states.items()},
             "user_window_offsets": {
                 str(uid): offsets for uid, offsets in self.user_window_offsets.items()
@@ -127,6 +132,7 @@ class SessionManager:
             },
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
+            "topic_owners": self.topic_owners,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -144,6 +150,13 @@ class SessionManager:
         if config.state_file.exists():
             try:
                 state = json.loads(config.state_file.read_text())
+                expected_scope = "chat" if config.chat_scoped_topics else "user"
+                if state.get("routing_scope", "user") != expected_scope:
+                    raise RuntimeError(
+                        "CCBot routing scope differs from saved state. "
+                        "Restore the previous setting or archive state.json "
+                        "before starting with new topic bindings."
+                    )
                 self.window_states = {
                     k: WindowState.from_dict(v)
                     for k, v in state.get("window_states", {}).items()
@@ -160,6 +173,7 @@ class SessionManager:
                 self.group_chat_ids = {
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
+                self.topic_owners = state.get("topic_owners", {})
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -834,6 +848,33 @@ class SessionManager:
         self._save_state()
 
     # --- Thread binding management ---
+
+    def claim_topic(
+        self,
+        chat_id: int,
+        thread_id: int,
+        user_id: int,
+        username: str | None,
+        first_name: str,
+    ) -> dict[str, Any]:
+        """Persist the first owner; refresh names only for that same user ID."""
+        key = f"{chat_id}:{thread_id}"
+        owner = self.topic_owners.get(key)
+        if owner is None:
+            owner = {
+                "user_id": user_id,
+                "username": username,
+                "first_name": first_name,
+                "announced": False,
+            }
+            self.topic_owners[key] = owner
+            self._save_state()
+        elif owner["user_id"] == user_id and (
+            owner.get("username") != username or owner.get("first_name") != first_name
+        ):
+            owner.update(username=username, first_name=first_name)
+            self._save_state()
+        return owner
 
     def bind_thread(
         self, user_id: int, thread_id: int, window_id: str, window_name: str = ""

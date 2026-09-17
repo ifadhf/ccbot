@@ -13,6 +13,7 @@ Key functions: hook_main() (CLI entry), _install_hook().
 
 import argparse
 import fcntl
+import html
 import json
 import logging
 import os
@@ -56,13 +57,13 @@ def _find_ccbot_path() -> str:
     return "ccbot"
 
 
-def _is_hook_installed(settings: dict) -> bool:
+def _is_hook_installed(settings: dict, event: str = "SessionStart") -> bool:
     """Check if ccbot hook is already installed in the settings.
 
     Detects both 'ccbot hook' and full paths like '/path/to/ccbot hook'.
     """
     hooks = settings.get("hooks", {})
-    session_start = hooks.get("SessionStart", [])
+    session_start = hooks.get(event, [])
 
     for entry in session_start:
         if not isinstance(entry, dict):
@@ -96,8 +97,8 @@ def _install_hook() -> int:
             print(f"Error reading {settings_file}: {e}", file=sys.stderr)
             return 1
 
-    # Check if already installed
-    if _is_hook_installed(settings):
+    events = ("SessionStart", "Stop", "Notification")
+    if all(_is_hook_installed(settings, event) for event in events):
         logger.info("Hook already installed in %s", settings_file)
         print(f"Hook already installed in {settings_file}")
         return 0
@@ -105,16 +106,15 @@ def _install_hook() -> int:
     # Find the full path to ccbot
     ccbot_path = _find_ccbot_path()
     hook_command = f"{ccbot_path} hook"
-    hook_config = {"type": "command", "command": hook_command, "timeout": 5}
+    hook_config = {"type": "command", "command": hook_command, "timeout": 30}
     logger.info("Installing hook command: %s", hook_command)
 
     # Install the hook
     if "hooks" not in settings:
         settings["hooks"] = {}
-    if "SessionStart" not in settings["hooks"]:
-        settings["hooks"]["SessionStart"] = []
-
-    settings["hooks"]["SessionStart"].append({"hooks": [hook_config]})
+    for event in events:
+        if not _is_hook_installed(settings, event):
+            settings["hooks"].setdefault(event, []).append({"hooks": [hook_config]})
 
     # Write back
     try:
@@ -215,7 +215,7 @@ def _get_user_mention(user_id: str, token: str, cfg_dir: Path) -> str:
             logger.debug("getChat failed for user %s: %s", user_id, e)
             label = "you"
 
-    return f'<a href="tg://user?id={user_id}">{label}</a>'
+    return f'<a href="tg://user?id={user_id}">{html.escape(label)}</a>'
 
 
 def _notify_telegram(event: str, payload: dict) -> None:
@@ -295,14 +295,26 @@ def _notify_telegram(event: str, payload: dict) -> None:
         logger.warning("No TELEGRAM_BOT_TOKEN available, cannot notify")
         return
 
-    mention = _get_user_mention(user_id, token, cfg_dir)
+    owner = state.get("topic_owners", {}).get(f"{chat_id}:{thread_id}", {})
+    if isinstance(owner.get("user_id"), int) and owner["user_id"] > 0:
+        label = (
+            ("@" + owner["username"])
+            if owner.get("username")
+            else owner.get("first_name", "pemilik")
+        )
+        mention = f'<a href="tg://user?id={owner["user_id"]}">{html.escape(label)}</a>'
+    else:
+        # Legacy private bindings identify a user; shared group IDs do not.
+        mention = _get_user_mention(user_id, token, cfg_dir) if int(user_id) > 0 else ""
     if event == "Stop":
-        text = f"✅ Task selesai — menunggu input {mention}"
+        text = f"✅ Task selesai — menunggu input {mention}".rstrip()
     else:  # Notification
         # Always generic: the real payload message (e.g. "Claude needs your
         # permission") is misleading for non-risky prompts like AskUserQuestion,
         # which also fires notification_type=permission_prompt.
-        text = f"🔔 Claude needs your attention — {mention}"
+        text = "🔔 Claude needs your attention"
+        if mention:
+            text += f" — {mention}"
 
     data = urllib.parse.urlencode(
         {
@@ -320,7 +332,7 @@ def _notify_telegram(event: str, payload: dict) -> None:
         ) as resp:
             logger.info("Sent %s notification (HTTP %s)", event, resp.status)
     except Exception as e:
-        logger.warning("Failed to send %s notification: %s", event, e)
+        logger.warning("Failed to send %s notification (%s)", event, type(e).__name__)
 
 
 def hook_main() -> None:
@@ -359,21 +371,6 @@ def hook_main() -> None:
     session_id = payload.get("session_id", "")
     cwd = payload.get("cwd", "")
     event = payload.get("hook_event_name", "")
-
-    # TEMPORARY: capture raw Stop payloads to check whether Stop fires for
-    # subagent (Task) completions too, or only for the main turn.
-    # Remove once confirmed.
-    if event == "Stop":
-        try:
-            import time as _time
-
-            from .utils import ccbot_dir as _ccbot_dir
-
-            dump_file = _ccbot_dir() / "stop_payload_samples.jsonl"
-            with open(dump_file, "a") as f:
-                f.write(json.dumps({"captured_at": _time.time(), "payload": payload}) + "\n")
-        except OSError:
-            pass
 
     if not session_id or not event:
         logger.debug("Empty session_id or event, ignoring")
