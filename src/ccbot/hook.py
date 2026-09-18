@@ -181,6 +181,32 @@ def _window_id_for_session(cfg_dir: Path, session_id: str) -> str | None:
     return None
 
 
+def _get_tmux_recovery_metadata() -> dict[str, str]:
+    """Attach live tmux identities so stale hooks cannot confirm a new restore."""
+    result = subprocess.run(
+        [
+            "tmux",
+            "display-message",
+            "-t",
+            os.environ.get("TMUX_PANE", ""),
+            "-p",
+            "#{@ccbot-instance-id}:#{@ccbot-recovery-token}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    values = result.stdout.strip().split(":")
+    if result.returncode or len(values) != 2:
+        return {}
+    return {
+        key: value
+        for key, value in zip(
+            ("tmux_session_identity", "recovery_token"), values, strict=True
+        )
+        if _UUID_RE.fullmatch(value)
+    }
+
+
 # Minimum seconds between identical event notifications per window
 _NOTIFY_DEBOUNCE_SECS = 5.0
 
@@ -425,6 +451,11 @@ def hook_main() -> None:
     tmux_session_name, window_id, window_name = window
     # Key uses window_id for uniqueness
     session_window_key = f"{tmux_session_name}:{window_id}"
+    recovery_metadata = _get_tmux_recovery_metadata()
+    if window_name.startswith("__ccbot_recovery_"):
+        token = window_name.removeprefix("__ccbot_recovery_")
+        if _UUID_RE.fullmatch(token):
+            recovery_metadata.setdefault("recovery_token", token)
 
     logger.debug(
         "tmux key=%s, window_name=%s, session_id=%s, cwd=%s",
@@ -459,6 +490,7 @@ def hook_main() -> None:
                     "session_id": session_id,
                     "cwd": cwd,
                     "window_name": window_name,
+                    **recovery_metadata,
                 }
 
                 # Clean up old-format key ("session:window_name") if it exists.

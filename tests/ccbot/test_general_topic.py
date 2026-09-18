@@ -39,6 +39,7 @@ async def test_general_topic_dispatch(
 
     monkeypatch.setattr(ExtBot, "initialize", initialize_bot)
     monkeypatch.setattr(ExtBot, "shutdown", AsyncMock())
+    monkeypatch.setattr(bot_module, "prepare_recovery", AsyncMock())
     monkeypatch.setattr(config, "telegram_bot_token", "123456:test-token")
     handlers = {}
     for name in [

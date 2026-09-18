@@ -44,6 +44,7 @@ def payload(kind="created", topic=42, user_id=111, chat_id=-10011):
 
 @pytest.fixture
 async def fixed_app(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot_module, "prepare_recovery", AsyncMock())
     workspace = tmp_path / "agrinas"
     workspace.mkdir()
     monkeypatch.setattr(config, "fixed_workdir", workspace)
@@ -249,3 +250,69 @@ def test_config_validates_fixed_directory(monkeypatch, tmp_path, kind):
             Config()
     else:
         assert Config().fixed_workdir == (tmp_path if raw else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["text", "document"])
+async def test_pending_recovery_blocks_fresh_session_and_file_dispatch(fixed_app, kind):
+    app, manager, windows, _ = fixed_app
+    await app.process_update(Update.de_json(payload(), app.bot))
+    windows.clear()
+    manager.stage_recovery(-10011, 42)
+    await app.process_update(Update.de_json(payload(kind), app.bot))
+    assert windows == {}
+    assert bot_module.tmux_manager.create_window.await_count == 1
+    manager.send_to_window.assert_not_awaited()
+    bot_module.receive_attachment.assert_not_awaited()
+    assert "/recover" in bot_module.safe_reply.call_args.args[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_id", [111, 222, 999])
+async def test_only_topic_owner_can_retry_recovery(fixed_app, monkeypatch, user_id):
+    app, manager, windows, _ = fixed_app
+    await app.process_update(Update.de_json(payload(), app.bot))
+    windows.clear()
+    manager.stage_recovery(-10011, 42)
+    retry = AsyncMock(return_value=False)
+    monkeypatch.setattr(bot_module, "recover_topic", retry)
+    update = payload("text", user_id=user_id)
+    update["message"]["text"] = "/recover"
+    update["message"]["entities"] = [{"type": "bot_command", "offset": 0, "length": 8}]
+    await app.process_update(Update.de_json(update, app.bot))
+    if user_id == 111:
+        retry.assert_awaited_once_with(manager, -10011, 42)
+    else:
+        retry.assert_not_awaited()
+    assert manager.pending_recoveries
+
+
+@pytest.mark.asyncio
+async def test_explicit_unbind_allows_fresh_session_after_failed_recovery(fixed_app):
+    app, manager, windows, _ = fixed_app
+    await app.process_update(Update.de_json(payload(), app.bot))
+    windows.clear()
+    manager.stage_recovery(-10011, 42)
+    update = payload("text")
+    update["message"]["text"] = "/unbind"
+    update["message"]["entities"] = [{"type": "bot_command", "offset": 0, "length": 7}]
+    await app.process_update(Update.de_json(update, app.bot))
+    assert not manager.pending_recoveries
+    await app.process_update(Update.de_json(payload("text"), app.bot))
+    assert bot_module.tmux_manager.create_window.await_count == 2
+    assert manager.topic_owners["-10011:42"]["user_id"] == 111
+
+
+@pytest.mark.asyncio
+async def test_missing_window_on_first_message_preserves_previous_session(fixed_app):
+    app, manager, windows, _ = fixed_app
+    await app.process_update(Update.de_json(payload(), app.bot))
+    previous = manager.window_states["@1"].session_id
+    windows.clear()
+    await app.process_update(Update.de_json(payload("text"), app.bot))
+    assert (
+        manager.pending_recoveries["-10011:42"]["window_state"]["session_id"]
+        == previous
+    )
+    assert bot_module.tmux_manager.create_window.await_count == 1
+    manager.send_to_window.assert_not_awaited()

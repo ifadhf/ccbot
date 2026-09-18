@@ -136,6 +136,7 @@ from .handlers.response_builder import build_response_parts
 from .handlers.status_polling import status_poll_loop
 from .markdown_v2 import convert_markdown
 from .routing import conversation_id, get_topic_data
+from .recovery import cancel_recovery, prepare_recovery, recover_sessions, recover_topic
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
@@ -272,6 +273,78 @@ async def enforce_topic_owner(
             session_manager._save_state()
 
 
+async def require_recovered_topic(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Keep failed restores from falling through to fresh-session creation."""
+    user, chat, message = (
+        update.effective_user,
+        update.effective_chat,
+        update.effective_message,
+    )
+    topic_id = _get_thread_id(update)
+    if (
+        not user
+        or not is_user_allowed(user.id)
+        or not chat
+        or not message
+        or topic_id is None
+    ):
+        return
+    await prepare_recovery(session_manager)
+    key = f"{conversation_id(user.id, chat.id)}:{topic_id}"
+    pending = session_manager.pending_recoveries.get(key)
+    if not pending:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    command = parts[0].split("@")[0] if parts else ""
+    if not update.callback_query and (
+        command in {"/recover", "/unbind", "/kill"} or message.forum_topic_closed
+    ):
+        return
+    text = "This conversation needs recovery. Use /recover to retry, or /unbind to start a new one."
+    if update.callback_query:
+        await update.callback_query.answer(text, show_alert=True)
+    else:
+        await safe_reply(message, text)
+    raise ApplicationHandlerStop
+
+
+async def recover_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Retry this topic's original conversation; ownership is enforced first."""
+    user, chat, message = (
+        update.effective_user,
+        update.effective_chat,
+        update.effective_message,
+    )
+    topic_id = _get_thread_id(update)
+    if (
+        not user
+        or not is_user_allowed(user.id)
+        or not chat
+        or not message
+        or topic_id is None
+    ):
+        return
+    route_id = conversation_id(user.id, chat.id)
+    wid = session_manager.get_window_for_thread(route_id, topic_id)
+    if wid and not await tmux_manager.find_window_by_id(wid):
+        session_manager.stage_recovery(route_id, topic_id)
+    if await recover_topic(session_manager, route_id, topic_id):
+        await safe_reply(
+            message,
+            "The saved conversation is connected. Send your next message when ready.",
+        )
+    else:
+        pending = session_manager.pending_recoveries.get(f"{route_id}:{topic_id}")
+        reason = (
+            pending.get("error", "Recovery is pending")
+            if pending
+            else "No saved conversation for this topic"
+        )
+        await safe_reply(message, f"Recovery unavailable: {reason}.")
+
+
 async def _ensure_fixed_topic_window(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> str | None:
@@ -293,10 +366,19 @@ async def _ensure_fixed_topic_window(
         return None
     route_id = conversation_id(user.id, chat.id)
     async with _fixed_workspace_lock:
+        if f"{route_id}:{thread_id}" in session_manager.pending_recoveries:
+            await safe_reply(
+                message, "Use /recover to restore this topic's saved conversation."
+            )
+            return None
         wid = session_manager.get_window_for_thread(route_id, thread_id)
         if wid and not await tmux_manager.find_window_by_id(wid):
-            session_manager.unbind_thread(route_id, thread_id)
-            wid = None
+            session_manager.stage_recovery(route_id, thread_id)
+            await safe_reply(
+                message,
+                "The session stopped. Use /recover to resume its saved conversation.",
+            )
+            return None
         if wid is None:
             if not config.fixed_workdir.is_dir():
                 await safe_reply(
@@ -430,6 +512,13 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user.id, update.effective_chat.id if update.effective_chat else None
     )
     topic_data = get_topic_data(context, _get_thread_id(update))
+    if await cancel_recovery(session_manager, route_id, thread_id):
+        await clear_topic_state(route_id, thread_id, context.bot, topic_data)
+        await safe_reply(
+            update.message,
+            "Recovery cancelled. Your next message can start a new conversation.",
+        )
+        return
     wid = session_manager.get_window_for_thread(route_id, thread_id)
     if not wid:
         await safe_reply(update.message, "❌ No session bound to this topic.")
@@ -465,12 +554,13 @@ async def kill_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     topic_data = get_topic_data(context, _get_thread_id(update))
     wid = session_manager.get_window_for_thread(route_id, thread_id)
-    if not wid:
+    cancelled = await cancel_recovery(session_manager, route_id, thread_id, kill=True)
+    if not wid and not cancelled:
         await safe_reply(update.message, "❌ No session bound to this topic.")
         return
 
-    display = session_manager.get_display_name(wid)
-    w = await tmux_manager.find_window_by_id(wid)
+    display = session_manager.get_display_name(wid) if wid else "pending recovery"
+    w = await tmux_manager.find_window_by_id(wid) if wid else None
     if w:
         await tmux_manager.kill_window(w.window_id)
         logger.info(
@@ -705,6 +795,9 @@ async def topic_closed_handler(
         user.id, update.effective_chat.id if update.effective_chat else None
     )
     topic_data = get_topic_data(context, _get_thread_id(update))
+    if await cancel_recovery(session_manager, route_id, thread_id, kill=True):
+        await clear_topic_state(route_id, thread_id, context.bot, topic_data)
+        return
     wid = session_manager.get_window_for_thread(route_id, thread_id)
     if wid:
         display = session_manager.get_display_name(wid)
@@ -1222,6 +1315,7 @@ async def text_handler(
             (w.window_id, w.window_name, w.cwd)
             for w in all_windows
             if w.window_id not in bound_ids
+            and not session_manager.is_recovery_window(w.recovery_token)
         ]
         logger.debug(
             "Window picker check: all=%s, bound=%s, unbound=%s",
@@ -1270,16 +1364,15 @@ async def text_handler(
     if not w:
         display = session_manager.get_display_name(wid)
         logger.info(
-            "Stale binding: window %s gone, unbinding (user=%d, thread=%d)",
+            "Stale binding: window %s gone, preserving (user=%d, thread=%d)",
             display,
             user.id,
             thread_id,
         )
-        session_manager.unbind_thread(route_id, thread_id)
+        session_manager.stage_recovery(route_id, thread_id)
         await safe_reply(
             update.message,
-            f"❌ Window '{display}' no longer exists. Binding removed.\n"
-            "Send a message to start a new session.",
+            f"Window '{display}' stopped. Use /recover to resume the saved conversation.",
         )
         return
 
@@ -1847,6 +1940,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             display = session_manager.get_display_name(selected_wid)
             await query.answer(f"Window '{display}' no longer exists", show_alert=True)
             return
+        if session_manager.is_recovery_window(w.recovery_token):
+            await query.answer(
+                "This window is reserved for another topic's recovery.", show_alert=True
+            )
+            return
 
         thread_id = _get_thread_id(update)
         if thread_id is None:
@@ -2212,6 +2310,7 @@ async def post_init(application: Application) -> None:
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("mode", "Cycle permission mode (Shift+Tab)"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
+        BotCommand("recover", "Resume this topic's saved conversation"),
         BotCommand("usage", "Show Claude Code usage remaining"),
     ]
     # Add Claude Code slash commands
@@ -2225,7 +2324,8 @@ async def post_init(application: Application) -> None:
         bot_commands, scope=BotCommandScopeAllGroupChats()
     )
 
-    # Re-resolve stale window IDs from persisted state against live tmux windows
+    # Restore from state.json before any cleanup can discard lost bindings.
+    await recover_sessions(session_manager)
     await session_manager.resolve_stale_ids()
 
     # Pre-fill global rate limiter bucket on restart.
@@ -2287,8 +2387,9 @@ def create_bot() -> Application:
         .build()
     )
 
-    application.add_handler(TypeHandler(Update, ignore_general_topic), group=-2)
-    application.add_handler(TypeHandler(Update, enforce_topic_owner), group=-1)
+    application.add_handler(TypeHandler(Update, ignore_general_topic), group=-3)
+    application.add_handler(TypeHandler(Update, enforce_topic_owner), group=-2)
+    application.add_handler(TypeHandler(Update, require_recovered_topic), group=-1)
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
@@ -2296,6 +2397,7 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
+    application.add_handler(CommandHandler("recover", recover_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(

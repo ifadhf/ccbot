@@ -66,6 +66,8 @@ def update_payload(
 
 @pytest.fixture
 async def owner_app(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot_module, "prepare_recovery", AsyncMock())
+
     async def initialize(bot):
         bot._bot_user = User(123456, "Bot", True, username="test_bot")
         bot._initialized = True

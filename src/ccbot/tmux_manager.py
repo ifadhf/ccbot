@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,7 @@ class TmuxWindow:
     window_name: str
     cwd: str  # Current working directory
     pane_current_command: str = ""  # Process running in active pane
+    recovery_token: str = ""  # Identifies a journaled restore across bot crashes.
 
 
 class TmuxManager:
@@ -134,6 +136,16 @@ class TmuxManager:
                             window_name=name,
                             cwd=cwd,
                             pane_current_command=pane_cmd,
+                            recovery_token=str(
+                                window.show_option(
+                                    "@ccbot-recovery-token", ignore_errors=True
+                                )
+                                or (
+                                    name.removeprefix("__ccbot_recovery_")
+                                    if name.startswith("__ccbot_recovery_")
+                                    else ""
+                                )
+                            ),
                         )
                     )
                 except Exception as e:
@@ -142,6 +154,19 @@ class TmuxManager:
             return windows
 
         return await asyncio.to_thread(_sync_list_windows)
+
+    async def session_identity(self) -> tuple[str, float]:
+        """Identify this tmux session lifetime, including server/window-ID resets."""
+
+        def identify() -> tuple[str, float]:
+            session = self.get_session() or self.get_or_create_session()
+            identity = session.show_option("@ccbot-instance-id", ignore_errors=True)
+            if not identity:
+                identity = str(uuid.uuid4())
+                session.set_option("@ccbot-instance-id", identity)
+            return str(identity), float(session.session_created or 0)
+
+        return await asyncio.to_thread(identify)
 
     async def find_window_by_name(self, window_name: str) -> TmuxWindow | None:
         """Find a window by its name.
@@ -376,6 +401,7 @@ class TmuxManager:
         window_name: str | None = None,
         start_claude: bool = True,
         resume_session_id: str | None = None,
+        recovery_token: str | None = None,
     ) -> tuple[bool, str, str, str]:
         """Create a new tmux window and optionally start Claude Code.
 
@@ -384,6 +410,7 @@ class TmuxManager:
             window_name: Optional window name (defaults to directory name)
             start_claude: Whether to start claude command
             resume_session_id: If set, append --resume <id> to claude command
+            recovery_token: Journal token attached before launching a restore.
 
         Returns:
             Tuple of (success, message, window_name, window_id)
@@ -401,6 +428,12 @@ class TmuxManager:
         if resume_session_id and not _UUID_RE.fullmatch(resume_session_id):
             logger.error("Rejecting non-UUID resume_session_id: %r", resume_session_id)
             return False, "Invalid session ID for resume", "", ""
+        if recovery_token and (
+            not _UUID_RE.fullmatch(recovery_token)
+            or not resume_session_id
+            or not start_claude
+        ):
+            return False, "Invalid recovery launch", "", ""
 
         # Create window name, adding suffix if name already exists
         final_window_name = window_name if window_name else path.name
@@ -418,17 +451,32 @@ class TmuxManager:
             try:
                 # Create new window
                 window = session.new_window(
-                    window_name=final_window_name,
+                    window_name=(
+                        f"__ccbot_recovery_{recovery_token}"
+                        if recovery_token
+                        else final_window_name
+                    ),
                     start_directory=str(path),
+                    # The identifiable window and its resume command are one
+                    # tmux operation, so a bot crash cannot strand a shell that
+                    # a retry would mistake for an already launched Claude.
+                    window_shell=(
+                        f"{config.claude_command} --resume {resume_session_id}"
+                        if recovery_token
+                        else None
+                    ),
                 )
 
                 wid = window.window_id or ""
 
                 # Prevent Claude Code from overriding window name
-                window.set_window_option("allow-rename", "off")
+                window.set_option("allow-rename", "off")
+                if recovery_token:
+                    window.set_option("@ccbot-recovery-token", recovery_token)
+                    window.rename_window(final_window_name)
 
                 # Start Claude Code if requested
-                if start_claude:
+                if start_claude and not recovery_token:
                     pane = window.active_pane
                     if pane:
                         cmd = config.claude_command
