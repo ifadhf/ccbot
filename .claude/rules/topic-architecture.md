@@ -19,8 +19,8 @@ Window IDs (e.g. `@0`, `@12`) are guaranteed unique within a tmux server session
 
 ```python
 # session.py: SessionManager
-thread_bindings: dict[int, dict[int, str]]  # user_id → {thread_id → window_id}
-window_display_names: dict[str, str]        # window_id → window_name (for display)
+thread_bindings: dict[int, dict[int, str]]  # routing_id → {thread_id → window_id}
+window_display_names: dict[str, str]  # window_id → window_name (for display)
 ```
 
 - Storage: memory + `state.json`
@@ -32,8 +32,16 @@ window_display_names: dict[str, str]        # window_id → window_name (for dis
 ```python
 # session_map.json (key format: "tmux_session:window_id")
 {
-  "ccbot:@0": {"session_id": "uuid-xxx", "cwd": "/path/to/project", "window_name": "project"},
-  "ccbot:@5": {"session_id": "uuid-yyy", "cwd": "/path/to/project", "window_name": "project-2"}
+    "ccbot:@0": {
+        "session_id": "uuid-xxx",
+        "cwd": "/path/to/project",
+        "window_name": "project",
+    },
+    "ccbot:@5": {
+        "session_id": "uuid-yyy",
+        "cwd": "/path/to/project",
+        "window_name": "project-2",
+    },
 }
 ```
 
@@ -62,12 +70,14 @@ SessionMonitor reads new message (session_id = "uuid-xxx")
 
 **Resume session flow**: When selecting a directory with existing Claude sessions, a session picker UI is shown. Choosing a session runs `claude --resume <session_id>`. Note: messages continue writing to the original JSONL file, and current Claude Code reports the original session_id in the SessionStart hook (`source: "resume"`), so state stays consistent. As a safety net for hook timeout or older Claude Code versions that report a different session_id, the bot forces both window_state and session_map.json (via `override_session_map_entry`, under the hook's flock) to the resumed session_id.
 
-**Topic lifecycle**: Closing/deleting a topic auto-kills the associated tmux window and unbinds the thread. Stale bindings (window deleted externally) are cleaned up by the status polling loop.
+**Topic lifecycle**: Closing/deleting a topic auto-kills the associated tmux window and unbinds the thread. Lost bindings are journaled for recovery instead of silently removed. A topic with pending recovery cannot create or select a replacement until its owner explicitly uses `/unbind`.
 
 ## Session Lifecycle
 
-**Startup cleanup**: On bot startup, all tracked sessions not present in session_map are cleaned up, preventing monitoring of closed sessions.
+**Startup recovery**: `recovery.py` runs before stale-ID cleanup and monitoring. Existing `state.json` holds `pending_recoveries["routing_id:topic_id"]` and `tmux_session_identity`. Lost bindings are checkpointed before launching any new windows. Recovery uses the original directory and `claude --resume <session_id>` without resending a prompt. The window's recovery token and the hook's token, tmux lifetime, session ID, and directory must all match before rebinding. This path never forces a session-map entry. Failed records remain available for the owner's `/recover` command; unrelated topics continue.
+
+**Cleanup**: Monitor offsets for pending conversations are preserved and unread output is not consumed while unbound. Live windows survive a bot-only restart. Input dispatch and background polling detect a changed tmux lifetime before trusting recycled window IDs. Hook entries from a different tmux lifetime cannot replace saved window state.
 
 **Runtime change detection**: Each polling cycle checks for session_map changes:
 - Window's session_id changed (e.g., after `/clear`) → clean up old session
-- Window deleted → clean up corresponding session
+- Window deleted → preserve its conversation and owner for recovery

@@ -6,8 +6,8 @@
 Control Claude Code sessions remotely via Telegram — monitor, interact, and manage AI coding sessions running in tmux.
 
 This branch includes the Agrinas customizations: topic ownership, chat-scoped
-sessions, Telegram file transfers, automatic sessions in a fixed workspace, and
-silent General topics. See the [customization guide](docs/agrinas-customizations.md)
+sessions, Telegram file transfers, automatic sessions in a fixed workspace,
+saved-conversation recovery, and silent General topics. See the [customization guide](docs/agrinas-customizations.md)
 for installation, configuration, migration, and the runtime Claude instructions.
 
 https://github.com/user-attachments/assets/15ffb38e-5eb9-4720-93b9-412e4961dc93

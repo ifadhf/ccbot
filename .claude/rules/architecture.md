@@ -71,6 +71,7 @@ Additional modules:
   screenshot.py       ─ Terminal text → PNG rendering (ANSI color, font fallback)
   transcribe.py       ─ Voice-to-text transcription via OpenAI API (gpt-4o-transcribe)
   main.py             ─ CLI entry point
+  recovery.py         ─ Restore original topic conversations before startup cleanup
   utils.py            ─ Shared utilities (ccbot_dir, atomic_write_json)
 
 Handler modules (handlers/):
@@ -84,7 +85,7 @@ Handler modules (handlers/):
   callback_data.py    ─ Callback data constants
 
 State files (~/.ccbot/ or $CCBOT_DIR/):
-  state.json         ─ thread bindings + window states + display names + read offsets
+  state.json         ─ bindings + window states + owners + offsets + recovery journal
   session_map.json   ─ hook-generated window_id→session mapping
   monitor_state.json ─ poll progress (byte offset) per JSONL file
 ```
@@ -99,4 +100,4 @@ State files (~/.ccbot/ or $CCBOT_DIR/):
 - **No truncation at parse layer** — Full content preserved; splitting at send layer respects Telegram's 4096 char limit with expandable quote atomicity.
 - Only sessions registered in `session_map.json` (via hook) are monitored.
 - Notifications delivered to users via thread bindings (topic → window_id → session).
-- **Startup re-resolution** — Window IDs reset on tmux server restart. On startup, `resolve_stale_ids()` matches persisted display names against live windows to re-map IDs. Old state.json files keyed by window name are auto-migrated.
+- **Startup recovery** — Window IDs reset on tmux server restart. Recovery journals lost topic bindings in the existing state file before creating windows or running `resolve_stale_ids()`. Original Claude IDs are resumed only in their saved directory, and fresh hooks confirm both tmux lifetime and recovery token. Owners and unread offsets survive. Failed topics remain pending for `/recover`; no prompt is replayed and names alone never identify a recovered conversation.

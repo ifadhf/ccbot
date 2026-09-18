@@ -411,6 +411,8 @@ class SessionMonitor:
         to be monitored until the hook re-fires with new format.
         Only entries matching our tmux_session_name are processed.
         """
+        from .session import session_manager
+
         window_to_session: dict[str, str] = {}
         if config.session_map_file.exists():
             try:
@@ -421,6 +423,14 @@ class SessionMonitor:
                 for key, info in session_map.items():
                     # Only process entries for our tmux session
                     if not key.startswith(prefix):
+                        continue
+                    if not isinstance(info, dict):
+                        continue
+                    hook_identity = info.get("tmux_session_identity")
+                    if (
+                        hook_identity
+                        and hook_identity != session_manager.tmux_session_identity
+                    ):
                         continue
                     window_key = key[len(prefix) :]
                     session_id = info.get("session_id", "")
@@ -433,7 +443,11 @@ class SessionMonitor:
     async def _cleanup_all_stale_sessions(self) -> None:
         """Clean up all tracked sessions not in current session_map (used on startup)."""
         current_map = await self._load_current_session_map()
-        active_session_ids = set(current_map.values())
+        from .session import session_manager
+
+        active_session_ids = (
+            set(current_map.values()) | session_manager.pending_session_ids()
+        )
 
         stale_sessions = []
         for session_id in self.state.tracked_sessions.keys():
@@ -485,6 +499,9 @@ class SessionMonitor:
             sessions_to_remove.add(old_session_id)
 
         # Perform cleanup
+        from .session import session_manager
+
+        sessions_to_remove -= session_manager.pending_session_ids()
         if sessions_to_remove:
             for session_id in sessions_to_remove:
                 self.state.remove_session(session_id)
@@ -504,8 +521,10 @@ class SessionMonitor:
         logger.info("Session monitor started, polling every %ss", self.poll_interval)
 
         # Deferred import to avoid circular dependency (cached once)
+        from .recovery import prepare_recovery
         from .session import session_manager
 
+        await prepare_recovery(session_manager)
         # Clean up all stale sessions on startup
         await self._cleanup_all_stale_sessions()
         # Initialize last known session_map
@@ -513,12 +532,15 @@ class SessionMonitor:
 
         while self._running:
             try:
+                await prepare_recovery(session_manager)
                 # Load hook-based session map updates
                 await session_manager.load_session_map()
 
                 # Detect session_map changes and cleanup replaced/removed sessions
                 current_map = await self._detect_and_cleanup_changes()
-                active_session_ids = set(current_map.values())
+                active_session_ids = (
+                    set(current_map.values()) - session_manager.pending_session_ids()
+                )
 
                 # Check for new messages (all I/O is async)
                 new_messages = await self.check_for_updates(active_session_ids)

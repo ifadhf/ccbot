@@ -1,16 +1,23 @@
 # Agrinas CCBot customizations
 
-Version `0.1.0+agrinas.4` extends `ifadhf/ccbot` at
+Version `0.1.0+agrinas.5` extends `ifadhf/ccbot` at
 `f2019b96081a0a7aa75a4478a1ef97c7a26ca84f` (`local-patches`). It supports private
 groups for individual users and a shared group, with an independent Claude
 session for each named Telegram topic.
 
+The recovery update is on `feat/agrinas-session-recovery`, based on commit
+`6d834ca788f39be5c81564136adc9e33ce6034bd` from
+`feat/agrinas-topics-files-workspace`.
+
 ## Install and configure
 
-Install this branch using the same account that runs tmux and Claude Code:
+Install the recovery branch using the same account that runs tmux and Claude
+Code. Back up the existing state and transcripts, then stop the bot before
+installing. The older `feat/agrinas-topics-files-workspace` branch contains
+`agrinas.4`, without recovery.
 
 ```bash
-git clone --branch feat/agrinas-topics-files-workspace https://github.com/ifadhf/ccbot.git
+git clone --branch feat/agrinas-session-recovery https://github.com/ifadhf/ccbot.git
 cd ccbot
 uv tool install .
 ccbot hook --install
@@ -68,6 +75,45 @@ buttons cannot change the selection. Existing live bindings are preserved.
 The workspace setting controls the starting directory and picker flow. It does
 not restrict the operating-system account's filesystem access, and separate
 topics can edit files in the same workspace.
+
+## Recovery after reboot
+
+At startup, CCBot uses the existing `state.json` to restore lost topic sessions
+before stale-window cleanup. It runs `claude --resume <saved-session-id>` in each
+conversation's original directory and reconnects its original Telegram topic
+only after a matching `SessionStart` hook. A bot-only restart keeps surviving
+windows. No user message or interrupted command is resent by recovery.
+
+The same file stores pending recoveries, original session IDs, directories,
+owners, display names, read offsets, and a tmux lifetime identifier. There is no
+second recovery state file. A unique launch token prevents duplicate processes
+after a bot crash, and the lifetime identifier prevents reused tmux IDs from
+mixing topics after a server reset. The hook carries both identifiers in the
+existing `session_map.json`; monitor offsets remain in `monitor_state.json`.
+
+The original transcript, working directory, Claude login, and installed hook
+must be available. A failed topic stays pending, with its saved state intact,
+while other topics recover. Ordinary messages and attachments do not create a
+replacement conversation or consume its unread output. The topic owner can
+use `/recover` after fixing the cause. `/unbind` deliberately cancels recovery
+and allows a new conversation; `/kill` also stops its recovery window. These
+operations preserve the owner record and conversation files.
+
+Previously closed or explicitly unbound topics are not resurrected from orphan
+window records or transcript files. Recovery requires a saved topic binding or
+pending recovery record; it never guesses the original topic from its name.
+
+If tmux disappears while the bot keeps running, the dispatch and polling paths
+preserve lost bindings before using new window IDs. Use `/recover` in each
+affected topic, or restart the bot later to retry all pending topics.
+
+An existing `agrinas.4` state is accepted without a separate migration file.
+Legacy windows are retained only when their tmux lifetime, ID, name, directory,
+and Claude process match. Invalid JSON stops startup instead of overwriting
+saved sessions. Back up `state.json`, `session_map.json`, `monitor_state.json`,
+and the original Claude transcripts before activation. Older CCBot versions
+ignore pending recovery records, so a downgrade must restore the matching
+pre-upgrade state backup while the bot is stopped.
 
 ## Telegram files and Claude instructions
 
@@ -136,8 +182,13 @@ uv run pytest --tb=short -q
 
 Regression tests cover cross-group routing, General-topic dispatch, ownership
 and callbacks, file boundaries and Telegram transport errors, hook installation,
-and fixed-workspace creation and retry behavior. Telegram transport is mocked;
-the suite does not send real messages or attachments.
+and fixed-workspace creation and retry behavior. Recovery tests cover cold
+startup, bot crashes during launch, reused IDs, failed topics, and retained
+owners and offsets. An integration test uses a unique tmux socket and a fake
+Claude CLI that invokes the real hook, then destroys only that test server to
+simulate a reboot. Telegram transport is mocked; the suite does not send real
+messages or attachments. Live Claude resume and an actual VM reboot have not
+been exercised for this development update.
 
 Ruff's original `E4`, `E7`, `E9`, and `F` rule selection is explicit in
 `pyproject.toml`, following the

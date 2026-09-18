@@ -26,6 +26,7 @@ import fcntl
 import json
 import logging
 import re
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +67,11 @@ class WindowState:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WindowState":
+        if not isinstance(data, dict) or any(
+            not isinstance(data.get(key, ""), str)
+            for key in ("session_id", "cwd", "window_name")
+        ):
+            raise ValueError("Invalid saved window state")
         return cls(
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
@@ -115,6 +121,11 @@ class SessionManager:
     group_chat_ids: dict[str, int] = field(default_factory=dict)
     # "chat_id:thread_id" -> owner identity; independent of tmux lifecycle.
     topic_owners: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Recovery journal in the existing state file, keyed by routing_id:topic_id.
+    pending_recoveries: dict[str, dict[str, Any]] = field(default_factory=dict)
+    tmux_session_identity: str = ""
+    loaded_state_mtime: float = 0.0
+    recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def __post_init__(self) -> None:
         self._load_state()
@@ -133,6 +144,8 @@ class SessionManager:
             "window_display_names": self.window_display_names,
             "group_chat_ids": self.group_chat_ids,
             "topic_owners": self.topic_owners,
+            "pending_recoveries": self.pending_recoveries,
+            "tmux_session_identity": self.tmux_session_identity,
         }
         atomic_write_json(config.state_file, state)
         logger.debug("State saved to %s", config.state_file)
@@ -150,6 +163,7 @@ class SessionManager:
         if config.state_file.exists():
             try:
                 state = json.loads(config.state_file.read_text())
+                self.loaded_state_mtime = config.state_file.stat().st_mtime
                 expected_scope = "chat" if config.chat_scoped_topics else "user"
                 if state.get("routing_scope", "user") != expected_scope:
                     raise RuntimeError(
@@ -174,6 +188,19 @@ class SessionManager:
                     k: int(v) for k, v in state.get("group_chat_ids", {}).items()
                 }
                 self.topic_owners = state.get("topic_owners", {})
+                self.pending_recoveries = state.get("pending_recoveries", {})
+                self.tmux_session_identity = state.get("tmux_session_identity", "")
+                if not isinstance(self.pending_recoveries, dict) or not isinstance(
+                    self.tmux_session_identity, str
+                ):
+                    raise ValueError("Invalid recovery state")
+                for key, record in self.pending_recoveries.items():
+                    if not isinstance(key, str) or not isinstance(record, dict):
+                        raise ValueError("Invalid recovery record")
+                    snapshot = record.get("window_state")
+                    if not isinstance(snapshot, dict):
+                        raise ValueError("Invalid recovery window state")
+                    WindowState.from_dict(snapshot)
 
                 # Detect old format: keys that don't look like window IDs
                 needs_migration = False
@@ -197,14 +224,54 @@ class SessionManager:
                     )
                     pass
 
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.warning("Failed to load state: %s", e)
-                self.window_states = {}
-                self.user_window_offsets = {}
-                self.thread_bindings = {}
-                self.window_display_names = {}
-                self.group_chat_ids = {}
-                pass
+            except (ValueError, TypeError, AttributeError, OSError) as e:
+                raise RuntimeError(
+                    "Cannot read CCBot state; refusing to overwrite saved sessions"
+                ) from e
+
+    def stage_recovery(self, route_id: int, topic_id: int) -> None:
+        """Move a lost binding into state.json before its window ID can be reused."""
+        wid = self.get_window_for_thread(route_id, topic_id)
+        if wid is None:
+            return
+        key = f"{route_id}:{topic_id}"
+        state = self.window_states.get(wid, WindowState())
+        snapshot = state.to_dict()
+        snapshot["window_name"] = (
+            self.window_display_names.get(wid) or state.window_name
+        )
+        self.pending_recoveries.setdefault(
+            key,
+            {
+                "window_state": snapshot,
+                "offset": self.user_window_offsets.get(route_id, {}).get(wid, 0),
+                "token": str(uuid.uuid4()),
+                "error": "Recovery has not completed",
+            },
+        )
+        del self.thread_bindings[route_id][topic_id]
+        if not self.thread_bindings[route_id]:
+            del self.thread_bindings[route_id]
+        if not any(other == wid for _, _, other in self.iter_thread_bindings()):
+            self.window_states.pop(wid, None)
+            self.window_display_names.pop(wid, None)
+            for offsets in self.user_window_offsets.values():
+                offsets.pop(wid, None)
+        self._save_state()
+
+    def pending_session_ids(self) -> set[str]:
+        """Keep monitor offsets for conversations waiting for recovery."""
+        return {
+            record["window_state"]["session_id"]
+            for record in self.pending_recoveries.values()
+            if record.get("window_state", {}).get("session_id")
+        }
+
+    def is_recovery_window(self, token: str) -> bool:
+        """Keep an unbound recovery attempt out of another topic's window picker."""
+        return bool(token) and any(
+            record.get("token") == token for record in self.pending_recoveries.values()
+        )
 
     async def resolve_stale_ids(self) -> None:
         """Re-resolve persisted window IDs against live tmux windows.
@@ -649,6 +716,13 @@ class SessionManager:
             # Only process entries for our tmux session
             if not key.startswith(prefix):
                 continue
+            if not isinstance(info, dict):
+                continue
+            hook_identity = info.get("tmux_session_identity")
+            if hook_identity and hook_identity != self.tmux_session_identity:
+                # A hook from another tmux lifetime cannot replace a saved
+                # conversation before recovery checkpoints its old binding.
+                continue
             window_id = key[len(prefix) :]
             if not self._is_window_id(window_id):
                 continue
@@ -670,14 +744,19 @@ class SessionManager:
                 state.cwd = new_cwd
                 changed = True
             # Update display name
-            if new_wname:
+            if new_wname and not new_wname.startswith("__ccbot_recovery_"):
                 state.window_name = new_wname
                 if self.window_display_names.get(window_id) != new_wname:
                     self.window_display_names[window_id] = new_wname
                     changed = True
 
         # Clean up window_states entries not in current session_map.
-        stale_wids = [w for w in self.window_states if w and w not in valid_wids]
+        bound_wids = {wid for _, _, wid in self.iter_thread_bindings()}
+        stale_wids = [
+            w
+            for w in self.window_states
+            if w and w not in valid_wids and w not in bound_wids
+        ]
         for wid in stale_wids:
             logger.info("Removing stale window_state: %s", wid)
             del self.window_states[wid]
@@ -887,6 +966,10 @@ class SessionManager:
             window_id: Tmux window ID (e.g. '@0')
             window_name: Display name for the window (optional)
         """
+        if f"{user_id}:{thread_id}" in self.pending_recoveries:
+            raise ValueError(
+                "Recover or explicitly unbind this topic before replacing it"
+            )
         if user_id not in self.thread_bindings:
             self.thread_bindings[user_id] = {}
         self.thread_bindings[user_id][thread_id] = window_id
@@ -904,6 +987,8 @@ class SessionManager:
 
     def unbind_thread(self, user_id: int, thread_id: int) -> str | None:
         """Remove a thread binding. Returns the previously bound window_id, or None."""
+        if self.pending_recoveries.pop(f"{user_id}:{thread_id}", None) is not None:
+            self._save_state()
         bindings = self.thread_bindings.get(user_id)
         if not bindings or thread_id not in bindings:
             return None
