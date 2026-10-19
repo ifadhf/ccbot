@@ -360,6 +360,9 @@ class SessionMonitor:
                         f"Read {len(new_entries)} new entries for "
                         f"session {session_info.session_id}"
                     )
+                    await self._follow_continuations(
+                        session_info.session_id, new_entries
+                    )
 
                 # Parse new entries using the shared logic, carrying over pending tools
                 carry = self._pending_tools.get(session_info.session_id, {})
@@ -401,6 +404,26 @@ class SessionMonitor:
 
         self.state.save_if_dirty()
         return new_messages
+
+    async def _follow_continuations(
+        self, session_id: str, entries: list[dict]
+    ) -> None:
+        """Repoint session_map when a transcript says it continued in a new session.
+
+        The next poll picks up the new id through the normal session_map
+        change path and starts tracking the new transcript from its end.
+        """
+        from .session import session_manager
+
+        for entry in entries:
+            if entry.get("type") != "continued-in":
+                continue
+            new_session_id = entry.get("continuedInSessionId", "")
+            if not new_session_id or new_session_id == session_id:
+                continue
+            await session_manager.follow_session_continuation(
+                session_id, new_session_id
+            )
 
     async def _load_current_session_map(self) -> dict[str, str]:
         """Load current session_map and return window_key -> session_id mapping.

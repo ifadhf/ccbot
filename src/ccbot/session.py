@@ -454,6 +454,35 @@ class SessionManager:
         if await asyncio.to_thread(self._mutate_session_map_locked, mutate):
             logger.info("session_map override: %s -> session_id=%s", key, session_id)
 
+    async def follow_session_continuation(
+        self, old_session_id: str, new_session_id: str
+    ) -> bool:
+        """Repoint windows bound to old_session_id at new_session_id.
+
+        `/background` hands a session to the claude daemon under a new id and
+        the old transcript ends with a "continued-in" entry. The new session's
+        hooks run in the daemon without TMUX_PANE, so the SessionStart hook
+        cannot update session_map itself. Returns True if any entry changed.
+        """
+        prefix = f"{config.tmux_session_name}:"
+
+        def mutate(session_map: dict[str, dict]) -> bool:
+            changed = False
+            for key, info in session_map.items():
+                if key.startswith(prefix) and info.get("session_id") == old_session_id:
+                    info["session_id"] = new_session_id
+                    changed = True
+            return changed
+
+        changed = await asyncio.to_thread(self._mutate_session_map_locked, mutate)
+        if changed:
+            logger.info(
+                "session_map: session %s continued in %s, following",
+                old_session_id,
+                new_session_id,
+            )
+        return changed
+
     async def _migrate_old_format_session_map_keys(
         self, live_by_name: dict[str, str]
     ) -> None:

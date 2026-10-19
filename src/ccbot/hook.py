@@ -165,6 +165,22 @@ def _get_tmux_window() -> tuple[str, str, str] | None:
     return parts[0], parts[1], parts[2]
 
 
+def _window_id_for_session(cfg_dir: Path, session_id: str) -> str | None:
+    """Return the window_id bound to session_id in session_map.json, if any."""
+    if not session_id:
+        return None
+    try:
+        session_map = json.loads((cfg_dir / "session_map.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    for key, info in session_map.items():
+        if isinstance(info, dict) and info.get("session_id") == session_id:
+            _, _, window_id = key.partition(":")
+            if window_id.startswith("@"):
+                return window_id
+    return None
+
+
 # Minimum seconds between identical event notifications per window
 _NOTIFY_DEBOUNCE_SECS = 5.0
 
@@ -240,12 +256,18 @@ def _notify_telegram(event: str, payload: dict) -> None:
             logger.debug("Skipping idle-nudge Notification (redundant with Stop)")
             return
 
-    window = _get_tmux_window()
-    if window is None:
-        return
-    _, window_id, _ = window
-
     cfg_dir = ccbot_dir()
+
+    window = _get_tmux_window()
+    if window is not None:
+        _, window_id, _ = window
+    else:
+        # Backgrounded sessions (/background) run in the claude daemon
+        # outside tmux; the bot follows them in session_map, so look there.
+        found = _window_id_for_session(cfg_dir, payload.get("session_id", ""))
+        if found is None:
+            return
+        window_id = found
 
     # Find the thread binding for this window
     state_file = cfg_dir / "state.json"
