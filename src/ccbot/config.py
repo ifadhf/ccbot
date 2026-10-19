@@ -66,6 +66,18 @@ class Config:
             os.getenv("CCBOT_TOPIC_OWNER_LOCK", "false").lower() == "true"
         )
 
+        # Silently drop General-topic updates instead of replying to them.
+        self.ignore_general_topic = (
+            os.getenv("CCBOT_IGNORE_GENERAL_TOPIC", "false").lower() == "true"
+        )
+        # Resume saved topic conversations after tmux loss; when off, a lost
+        # window unbinds its topic as before.
+        self.session_recovery = (
+            os.getenv("CCBOT_SESSION_RECOVERY", "false").lower() == "true"
+        )
+        # Telegram document downloads and the `ccbot files`/`send-file` helpers.
+        self.file_transfer = os.getenv("CCBOT_FILE_TRANSFER", "false").lower() == "true"
+
         # Tmux session name and window naming
         self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
         self.tmux_main_window_name = "__main__"

@@ -19,7 +19,10 @@ def file_topic(monkeypatch, tmp_path):
     monkeypatch.setattr(
         hook_module, "_get_tmux_window", lambda: ("ccbot", "@1", "project")
     )
-    (tmp_path / ".env").write_text("ALLOWED_USERS=111\nTMUX_SESSION_NAME=ccbot\n")
+    (tmp_path / ".env").write_text(
+        "ALLOWED_USERS=111\nTMUX_SESSION_NAME=ccbot\nCCBOT_FILE_TRANSFER=true\n"
+        "CCBOT_CHAT_SCOPED_TOPICS=true\nCCBOT_TOPIC_OWNER_LOCK=true\n"
+    )
     state = {
         "thread_bindings": {"-10011": {"42": "@1"}},
         "group_chat_ids": {"-10011:42": -10011},

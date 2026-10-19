@@ -229,6 +229,18 @@ class SessionManager:
                     "Cannot read CCBot state; refusing to overwrite saved sessions"
                 ) from e
 
+    def release_lost_binding(self, route_id: int, topic_id: int) -> bool:
+        """Handle a topic whose window is gone; True if it awaits recovery.
+
+        With CCBOT_SESSION_RECOVERY off the binding is simply removed, as
+        before recovery existed.
+        """
+        if config.session_recovery:
+            self.stage_recovery(route_id, topic_id)
+            return True
+        self.unbind_thread(route_id, topic_id)
+        return False
+
     def stage_recovery(self, route_id: int, topic_id: int) -> None:
         """Move a lost binding into state.json before its window ID can be reused."""
         wid = self.get_window_for_thread(route_id, topic_id)
@@ -995,7 +1007,10 @@ class SessionManager:
             window_id: Tmux window ID (e.g. '@0')
             window_name: Display name for the window (optional)
         """
-        if f"{user_id}:{thread_id}" in self.pending_recoveries:
+        if (
+            config.session_recovery
+            and f"{user_id}:{thread_id}" in self.pending_recoveries
+        ):
             raise ValueError(
                 "Recover or explicitly unbind this topic before replacing it"
             )

@@ -191,6 +191,8 @@ async def ignore_general_topic(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Drop General-topic updates before commands or authorization can reply."""
+    if not config.ignore_general_topic:
+        return
     chat = update.effective_chat
     message = update.effective_message
     # Replies in General can carry a reply-thread ID even though they are
@@ -277,6 +279,8 @@ async def require_recovered_topic(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Keep failed restores from falling through to fresh-session creation."""
+    if not config.session_recovery:
+        return
     user, chat, message = (
         update.effective_user,
         update.effective_chat,
@@ -366,19 +370,23 @@ async def _ensure_fixed_topic_window(
         return None
     route_id = conversation_id(user.id, chat.id)
     async with _fixed_workspace_lock:
-        if f"{route_id}:{thread_id}" in session_manager.pending_recoveries:
+        if (
+            config.session_recovery
+            and f"{route_id}:{thread_id}" in session_manager.pending_recoveries
+        ):
             await safe_reply(
                 message, "Use /recover to restore this topic's saved conversation."
             )
             return None
         wid = session_manager.get_window_for_thread(route_id, thread_id)
         if wid and not await tmux_manager.find_window_by_id(wid):
-            session_manager.stage_recovery(route_id, thread_id)
-            await safe_reply(
-                message,
-                "The session stopped. Use /recover to resume its saved conversation.",
-            )
-            return None
+            if session_manager.release_lost_binding(route_id, thread_id):
+                await safe_reply(
+                    message,
+                    "The session stopped. Use /recover to resume its saved conversation.",
+                )
+                return None
+            wid = None  # Unbound: start a fresh session in the workspace below.
         if wid is None:
             if not config.fixed_workdir.is_dir():
                 await safe_reply(
@@ -948,7 +956,9 @@ async def unsupported_content_handler(
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         update.message,
-        "⚠ Send text, a photo, a voice message, or a file attachment. Send other media as a document.",
+        "⚠ Send text, a photo, a voice message, or a file attachment. Send other media as a document."
+        if config.file_transfer
+        else "⚠ Only text, photo, and voice messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
     )
 
 
@@ -1363,16 +1373,20 @@ async def text_handler(
     w = await tmux_manager.find_window_by_id(wid)
     if not w:
         display = session_manager.get_display_name(wid)
+        staged = session_manager.release_lost_binding(route_id, thread_id)
         logger.info(
-            "Stale binding: window %s gone, preserving (user=%d, thread=%d)",
+            "Stale binding: window %s gone, %s (user=%d, thread=%d)",
             display,
+            "preserving" if staged else "unbinding",
             user.id,
             thread_id,
         )
-        session_manager.stage_recovery(route_id, thread_id)
         await safe_reply(
             update.message,
-            f"Window '{display}' stopped. Use /recover to resume the saved conversation.",
+            f"Window '{display}' stopped. Use /recover to resume the saved conversation."
+            if staged
+            else f"❌ Window '{display}' no longer exists. Binding removed.\n"
+            "Send a message to start a new session.",
         )
         return
 
@@ -2310,9 +2324,12 @@ async def post_init(application: Application) -> None:
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("mode", "Cycle permission mode (Shift+Tab)"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
-        BotCommand("recover", "Resume this topic's saved conversation"),
         BotCommand("usage", "Show Claude Code usage remaining"),
     ]
+    if config.session_recovery:
+        bot_commands.insert(
+            -1, BotCommand("recover", "Resume this topic's saved conversation")
+        )
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
         bot_commands.append(BotCommand(cmd_name, desc))
@@ -2397,7 +2414,8 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("kill", kill_command))
     application.add_handler(CommandHandler("mode", mode_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
-    application.add_handler(CommandHandler("recover", recover_command))
+    if config.session_recovery:
+        application.add_handler(CommandHandler("recover", recover_command))
     application.add_handler(CommandHandler("usage", usage_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(
@@ -2424,7 +2442,9 @@ def create_bot() -> Application:
     )
     # Photos: download and forward file path to Claude Code
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+    # Documents: download into the topic inbox and forward the path
+    if config.file_transfer:
+        application.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     # Voice: transcribe via OpenAI and forward text to Claude Code
     application.add_handler(MessageHandler(filters.VOICE, voice_handler))
     # Catch-all: non-text content (stickers, video, etc.)

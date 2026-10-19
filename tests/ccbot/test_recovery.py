@@ -30,6 +30,10 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "claude_projects_path", tmp_path / "projects")
     monkeypatch.setattr(config, "chat_scoped_topics", True)
     monkeypatch.setattr(config, "topic_owner_lock", True)
+    # These tests exercise the opt-in VM features; all default to off.
+    monkeypatch.setattr(config, "ignore_general_topic", True)
+    monkeypatch.setattr(config, "session_recovery", True)
+    monkeypatch.setattr(config, "file_transfer", True)
     monkeypatch.setattr(config, "allowed_users", {111, 222})
     monkeypatch.setattr(config, "tmux_session_name", "ccbot")
     monkeypatch.setattr(recovery, "HOOK_TIMEOUT", 0)

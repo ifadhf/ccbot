@@ -405,9 +405,7 @@ class SessionMonitor:
         self.state.save_if_dirty()
         return new_messages
 
-    async def _follow_continuations(
-        self, session_id: str, entries: list[dict]
-    ) -> None:
+    async def _follow_continuations(self, session_id: str, entries: list[dict]) -> None:
         """Repoint session_map when a transcript says it continued in a new session.
 
         The next poll picks up the new id through the normal session_map

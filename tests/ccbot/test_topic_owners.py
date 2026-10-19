@@ -74,6 +74,10 @@ async def owner_app(monkeypatch, tmp_path):
         bot._requests_initialized = True
 
     monkeypatch.setattr(config, "topic_owner_lock", True)
+    # These tests exercise the opt-in VM features; all default to off.
+    monkeypatch.setattr(config, "ignore_general_topic", True)
+    monkeypatch.setattr(config, "session_recovery", True)
+    monkeypatch.setattr(config, "file_transfer", True)
     monkeypatch.setattr(config, "chat_scoped_topics", True)
     monkeypatch.setattr(config, "allowed_users", {111, 222})
     monkeypatch.setattr(config, "state_file", tmp_path / "state.json")

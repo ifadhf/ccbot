@@ -172,10 +172,15 @@ async def status_poll_loop(bot: Bot) -> None:
                     # Clean up stale bindings (window no longer exists)
                     w = await tmux_manager.find_window_by_id(wid)
                     if not w:
-                        session_manager.stage_recovery(user_id, thread_id)
+                        staged = session_manager.release_lost_binding(
+                            user_id, thread_id
+                        )
                         await clear_topic_state(user_id, thread_id, bot)
                         logger.info(
-                            "Preserved lost session for recovery: user=%d thread=%d window_id=%s",
+                            "%s: user=%d thread=%d window_id=%s",
+                            "Preserved lost session for recovery"
+                            if staged
+                            else "Cleaned up stale binding",
                             user_id,
                             thread_id,
                             wid,

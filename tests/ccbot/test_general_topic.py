@@ -42,6 +42,10 @@ async def test_general_topic_dispatch(
     monkeypatch.setattr(ExtBot, "shutdown", AsyncMock())
     monkeypatch.setattr(bot_module, "prepare_recovery", AsyncMock())
     monkeypatch.setattr(config, "telegram_bot_token", "123456:test-token")
+    # These tests exercise the opt-in VM features; all default to off.
+    monkeypatch.setattr(config, "ignore_general_topic", True)
+    monkeypatch.setattr(config, "session_recovery", True)
+    monkeypatch.setattr(config, "file_transfer", True)
     handlers = {}
     for name in [
         "start_command",

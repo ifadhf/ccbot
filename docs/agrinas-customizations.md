@@ -35,13 +35,19 @@ CCBOT_SHOW_USER_MESSAGES=false
 CCBOT_SHOW_TOOL_CALLS=false
 CCBOT_SHOW_THINKING=false
 CCBOT_FIXED_WORKDIR=/srv/project
+CCBOT_IGNORE_GENERAL_TOPIC=true
+CCBOT_SESSION_RECOVERY=true
+CCBOT_FILE_TRANSFER=true
 ```
 
 Create the workspace first, with permissions for the account running CCBot.
 `CCBOT_FIXED_WORKDIR` must resolve to an existing absolute directory; leave it
 empty to retain the directory and session pickers. Restart CCBot after editing
-its configuration. The chat-scoped routing and owner-lock flags default to
-`false` when omitted, for compatibility with existing installations.
+its configuration. Every flag above defaults to `false` (or empty) when
+omitted, for compatibility with existing installations. With them all off the
+bot behaves like the original laptop build: General-topic messages get the
+usual "use a named topic" reply, a lost window unbinds its topic, documents get
+the unsupported-content reply, and `ccbot files`/`send-file` refuse to run.
 
 The hook installer preserves unrelated Claude settings and installs
 `SessionStart`, `Stop`, and `Notification` hooks. Completion notifications mention
@@ -63,8 +69,9 @@ tool-call details, and thinking output.
   usernames are refreshed when the owner sends another message. Ownership
   survives restarts and removal of a topic's window binding.
 - With owner locking disabled, allowed users share the topic's single session.
-- General-topic updates are silently ignored, including commands, attachments,
-  and callbacks. Use named topics for bot interaction.
+- With `CCBOT_IGNORE_GENERAL_TOPIC=true`, General-topic updates are silently
+  ignored, including commands, attachments, and callbacks. Use named topics
+  for bot interaction.
 
 With a fixed workspace configured, creating a topic immediately starts its own
 tmux window and fresh Claude session in that directory. The first message or
@@ -77,6 +84,8 @@ not restrict the operating-system account's filesystem access, and separate
 topics can edit files in the same workspace.
 
 ## Recovery after reboot
+
+Requires `CCBOT_SESSION_RECOVERY=true`; `/recover` is registered only then.
 
 At startup, CCBot uses the existing `state.json` to restore lost topic sessions
 before stale-window cleanup. It runs `claude --resume <saved-session-id>` in each
@@ -116,6 +125,10 @@ ignore pending recovery records, so a downgrade must restore the matching
 pre-upgrade state backup while the bot is stopped.
 
 ## Telegram files and Claude instructions
+
+Requires `CCBOT_FILE_TRANSFER=true`. Claude sessions moved to the background
+with `/background` run outside tmux; the helpers find their topic through
+`session_map.json` using `CLAUDE_CODE_SESSION_ID`.
 
 Incoming Telegram documents are saved in a private topic inbox. Their local
 paths and captions are forwarded to Claude. Files may be up to 20,000,000 bytes.

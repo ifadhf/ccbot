@@ -3,6 +3,7 @@
 Journal missing bindings before starting tmux windows, require a fresh matching
 SessionStart hook, and retain failed records for an owner-initiated retry.
 No user prompt or interrupted command is replayed by recovery.
+Everything here is a no-op unless CCBOT_SESSION_RECOVERY is enabled.
 """
 
 import asyncio
@@ -73,6 +74,8 @@ async def _prepare_state(
 
 async def prepare_recovery(manager: SessionManager) -> None:
     """Detect tmux loss before dispatch, including a reset while the bot stays up."""
+    if not config.session_recovery:
+        return
     async with manager.recovery_lock:
         identity, created = await tmux_manager.session_identity()
         if identity != manager.tmux_session_identity:
@@ -81,6 +84,8 @@ async def prepare_recovery(manager: SessionManager) -> None:
 
 async def recover_sessions(manager: SessionManager) -> None:
     """Recover before stale-window cleanup and before Telegram starts dispatching."""
+    if not config.session_recovery:
+        return
     async with manager.recovery_lock:
         identity, created = await tmux_manager.session_identity()
         await _prepare_state(manager, identity, created)
@@ -90,6 +95,8 @@ async def recover_sessions(manager: SessionManager) -> None:
 
 async def recover_topic(manager: SessionManager, route_id: int, topic_id: int) -> bool:
     """Retry one saved conversation without permitting concurrent duplicates."""
+    if not config.session_recovery:
+        return False
     async with manager.recovery_lock:
         identity, created = await tmux_manager.session_identity()
         if identity != manager.tmux_session_identity:
