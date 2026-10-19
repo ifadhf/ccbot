@@ -70,7 +70,8 @@ async def owner_app(monkeypatch, tmp_path):
 
     async def initialize(bot):
         bot._bot_user = User(123456, "Bot", True, username="test_bot")
-        bot._initialized = True
+        bot._bot_initialized = True
+        bot._requests_initialized = True
 
     monkeypatch.setattr(config, "topic_owner_lock", True)
     monkeypatch.setattr(config, "chat_scoped_topics", True)

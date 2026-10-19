@@ -73,7 +73,8 @@ async def fixed_app(monkeypatch, tmp_path):
 
     async def initialize(bot):
         bot._bot_user = User(123456, "Bot", True, username="test_bot")
-        bot._initialized = True
+        bot._bot_initialized = True
+        bot._requests_initialized = True
 
     monkeypatch.setattr(ExtBot, "initialize", initialize)
     monkeypatch.setattr(ExtBot, "shutdown", AsyncMock())

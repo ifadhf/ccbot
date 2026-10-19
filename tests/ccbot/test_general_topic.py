@@ -35,7 +35,8 @@ async def test_general_topic_dispatch(
     # No Telegram requests or real tmux/session operations occur in this test.
     async def initialize_bot(bot):
         bot._bot_user = User(123456, "Test", True, username="test_bot")
-        bot._initialized = True
+        bot._bot_initialized = True
+        bot._requests_initialized = True
 
     monkeypatch.setattr(ExtBot, "initialize", initialize_bot)
     monkeypatch.setattr(ExtBot, "shutdown", AsyncMock())
