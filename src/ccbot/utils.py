@@ -41,6 +41,12 @@ def atomic_write_json(path: Path, data: Any, indent: int = 2) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, str(path))
+        # Make the rename durable as well as the contents after power loss.
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             os.unlink(tmp_path)

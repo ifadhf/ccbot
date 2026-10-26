@@ -66,11 +66,18 @@ def update_payload(
 
 @pytest.fixture
 async def owner_app(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot_module, "prepare_recovery", AsyncMock())
+
     async def initialize(bot):
         bot._bot_user = User(123456, "Bot", True, username="test_bot")
-        bot._initialized = True
+        bot._bot_initialized = True
+        bot._requests_initialized = True
 
     monkeypatch.setattr(config, "topic_owner_lock", True)
+    # These tests exercise the opt-in VM features; all default to off.
+    monkeypatch.setattr(config, "ignore_general_topic", True)
+    monkeypatch.setattr(config, "session_recovery", True)
+    monkeypatch.setattr(config, "file_transfer", True)
     monkeypatch.setattr(config, "chat_scoped_topics", True)
     monkeypatch.setattr(config, "allowed_users", {111, 222})
     monkeypatch.setattr(config, "state_file", tmp_path / "state.json")

@@ -6,7 +6,8 @@ import sys
 
 import pytest
 
-from ccbot.hook import _UUID_RE, _is_hook_installed, hook_main
+import ccbot.hook as hook_module
+from ccbot.hook import _UUID_RE, _is_attach_to_job, _is_hook_installed, hook_main
 
 
 class TestUuidRegex:
@@ -144,3 +145,82 @@ class TestHookMainValidation:
             },
         )
         assert not (tmp_path / "session_map.json").exists()
+
+
+class TestBgSessionWindow:
+    """bg sessions run in the claude daemon without TMUX_PANE."""
+
+    @pytest.mark.parametrize(
+        "argv, expected",
+        [
+            (["/home/u/.local/bin/claude", "attach", "1a2b3c4d"], True),
+            (["claude", "attach", "1a2b3c4d-0000-4000-8000-000000000001"], True),
+            (["claude", "attach", "9f8e7d6c"], False),
+            (["claude", "--resume", "1a2b3c4d"], False),
+            (["vim", "attach", "1a2b3c4d"], False),
+            (["claude", "attach"], False),
+        ],
+        ids=["short", "full-id", "other-job", "not-attach", "not-claude", "no-arg"],
+    )
+    def test_is_attach_to_job(self, argv: list[str], expected: bool) -> None:
+        assert _is_attach_to_job(argv, "1a2b3c4d") is expected
+
+    def test_bg_job_id_walks_up_to_claude_process(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        sessions = tmp_path / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "300.json").write_text(
+            json.dumps({"sessionId": "x", "kind": "bg", "jobId": "1a2b3c4d"})
+        )
+        monkeypatch.setattr(hook_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(hook_module.os, "getppid", lambda: 100)
+        parents = {100: 200, 200: 300, 300: 1}
+        monkeypatch.setattr(hook_module, "_parent_pid", lambda pid: parents[pid])
+        assert hook_module._bg_job_id() == "1a2b3c4d"
+
+    def test_bg_job_id_none_for_foreground_session(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        sessions = tmp_path / ".claude" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "100.json").write_text(json.dumps({"sessionId": "x"}))
+        monkeypatch.setattr(hook_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(hook_module.os, "getppid", lambda: 100)
+        assert hook_module._bg_job_id() is None
+
+    def test_session_start_maps_attached_window(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+        monkeypatch.delenv("TMUX_PANE", raising=False)
+        monkeypatch.setattr(
+            hook_module,
+            "_get_attached_tmux_window",
+            lambda: ("ccbot", "@9", "project"),
+        )
+        targets: list[str] = []
+
+        def metadata(target: str) -> dict[str, str]:
+            targets.append(target)
+            return {"tmux_session_identity": "11111111-2222-4333-8444-555555555555"}
+
+        monkeypatch.setattr(hook_module, "_get_tmux_recovery_metadata", metadata)
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        payload = {
+            "session_id": "22222222-3333-4444-8555-666666666666",
+            "cwd": "/home/u/project",
+            "hook_event_name": "SessionStart",
+            "source": "clear",
+        }
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        hook_main()
+
+        session_map = json.loads((tmp_path / "session_map.json").read_text())
+        assert session_map["ccbot:@9"] == {
+            "session_id": "22222222-3333-4444-8555-666666666666",
+            "cwd": "/home/u/project",
+            "window_name": "project",
+            "tmux_session_identity": "11111111-2222-4333-8444-555555555555",
+        }
+        assert targets == ["@9"]

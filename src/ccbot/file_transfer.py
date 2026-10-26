@@ -3,6 +3,8 @@
 Incoming documents use a private per-topic inbox. The CLI uploads only regular
 files in that topic's outbox, resolves the destination from saved bindings, and
 keeps the bot token out of Claude prompts and command arguments.
+Disabled unless CCBOT_FILE_TRANSFER=true; backgrounded Claude sessions resolve
+their window through session_map.json by CLAUDE_CODE_SESSION_ID.
 """
 
 import argparse
@@ -66,37 +68,75 @@ async def receive_attachment(message: Message, chat_id: int, thread_id: int) -> 
     return path
 
 
-def current_topic() -> tuple[int, int]:
-    """Find exactly one owned, allowed topic for the current CCBot tmux pane."""
+def _settings() -> dict[str, str | None]:
+    """Read CCBot settings the way Config does: environment over <ccbot_dir>/.env."""
     from dotenv import dotenv_values
 
+    return {**dotenv_values(ccbot_dir() / ".env"), **os.environ}
+
+
+def _flag(values: dict[str, str | None], name: str) -> bool:
+    return (values.get(name) or "false").lower() == "true"
+
+
+def _current_window(values: dict[str, str | None]) -> str:
+    """Return the CCBot window ID of the Claude session running this command."""
     from .hook import _get_tmux_window
 
+    session_name = values.get("TMUX_SESSION_NAME") or "ccbot"
     window = _get_tmux_window()
-    if window is None:
-        raise ValueError("Run this command inside a topic's CCBot tmux pane.")
-    values = dotenv_values(ccbot_dir() / ".env")
-    if window[0] != values.get("TMUX_SESSION_NAME", "ccbot"):
-        raise ValueError("This pane is not in the CCBot tmux session.")
+    if window is not None and window[0] == session_name:
+        return window[1]
+    # Backgrounded sessions (/background) run in the claude daemon outside
+    # tmux; session_map records which CCBot window shows them.
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if session_id:
+        try:
+            session_map = json.loads((ccbot_dir() / "session_map.json").read_text())
+        except (OSError, ValueError):
+            session_map = {}
+        prefix = f"{session_name}:"
+        found = [
+            key.removeprefix(prefix)
+            for key, info in session_map.items()
+            if key.startswith(prefix)
+            and isinstance(info, dict)
+            and info.get("session_id") == session_id
+        ]
+        if len(found) == 1:
+            return found[0]
+    raise ValueError("Run this command inside a topic's CCBot Claude session.")
+
+
+def current_topic() -> tuple[int, int]:
+    """Find exactly one allowed topic bound to the current CCBot session."""
+    values = _settings()
+    if not _flag(values, "CCBOT_FILE_TRANSFER"):
+        raise ValueError("File transfer is disabled (set CCBOT_FILE_TRANSFER=true).")
+    window_id = _current_window(values)
     state = json.loads((ccbot_dir() / "state.json").read_text())
     matches = []
     for route_id, bindings in state.get("thread_bindings", {}).items():
-        for thread_id, window_id in bindings.items():
-            if window_id == window[1]:
+        for thread_id, bound_id in bindings.items():
+            if bound_id == window_id:
                 chat_id = state.get("group_chat_ids", {}).get(f"{route_id}:{thread_id}")
                 if chat_id and int(thread_id) > 1:
-                    matches.append((int(chat_id), int(thread_id)))
+                    matches.append((int(route_id), int(chat_id), int(thread_id)))
     if len(matches) != 1:
         raise ValueError("This window must be bound to exactly one named topic.")
-    chat_id, thread_id = matches[0]
-    owner = state.get("topic_owners", {}).get(f"{chat_id}:{thread_id}", {})
+    route_id, chat_id, thread_id = matches[0]
     allowed = {
         int(uid.strip())
         for uid in (values.get("ALLOWED_USERS") or "").split(",")
         if uid.strip()
     }
-    if owner.get("user_id") not in allowed:
-        raise ValueError("The topic has no authorized owner.")
+    if _flag(values, "CCBOT_TOPIC_OWNER_LOCK"):
+        owner = state.get("topic_owners", {}).get(f"{chat_id}:{thread_id}", {})
+        if owner.get("user_id") not in allowed:
+            raise ValueError("The topic has no authorized owner.")
+    elif not _flag(values, "CCBOT_CHAT_SCOPED_TOPICS") and route_id not in allowed:
+        # Per-user routing: the binding's key is the Telegram user ID.
+        raise ValueError("The topic's user is not allowed.")
     return chat_id, thread_id
 
 

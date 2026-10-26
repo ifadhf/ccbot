@@ -35,11 +35,17 @@ async def test_general_topic_dispatch(
     # No Telegram requests or real tmux/session operations occur in this test.
     async def initialize_bot(bot):
         bot._bot_user = User(123456, "Test", True, username="test_bot")
-        bot._initialized = True
+        bot._bot_initialized = True
+        bot._requests_initialized = True
 
     monkeypatch.setattr(ExtBot, "initialize", initialize_bot)
     monkeypatch.setattr(ExtBot, "shutdown", AsyncMock())
+    monkeypatch.setattr(bot_module, "prepare_recovery", AsyncMock())
     monkeypatch.setattr(config, "telegram_bot_token", "123456:test-token")
+    # These tests exercise the opt-in VM features; all default to off.
+    monkeypatch.setattr(config, "ignore_general_topic", True)
+    monkeypatch.setattr(config, "session_recovery", True)
+    monkeypatch.setattr(config, "file_transfer", True)
     handlers = {}
     for name in [
         "start_command",

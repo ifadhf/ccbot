@@ -165,6 +165,144 @@ def _get_tmux_window() -> tuple[str, str, str] | None:
     return parts[0], parts[1], parts[2]
 
 
+def _parent_pid(pid: int) -> int:
+    """Return the parent pid of pid from /proc, or 0 if it cannot be read."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        # comm (field 2) may contain spaces and parens; ppid follows state.
+        return int(stat.rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def _bg_job_id() -> str | None:
+    """Return the claude daemon job id of the bg session running this hook.
+
+    Background sessions run in the claude daemon, outside tmux. Each Claude
+    process records itself in ~/.claude/sessions/<pid>.json, with a "jobId"
+    for bg sessions, so walk up from the hook's parent to find it.
+    """
+    sessions_dir = Path.home() / ".claude" / "sessions"
+    pid = os.getppid()
+    for _ in range(8):
+        if pid <= 1:
+            break
+        try:
+            info = json.loads((sessions_dir / f"{pid}.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            pid = _parent_pid(pid)
+            continue
+        job_id = info.get("jobId") if isinstance(info, dict) else None
+        return job_id if isinstance(job_id, str) and job_id else None
+    return None
+
+
+def _is_attach_to_job(argv: list[str], job_id: str) -> bool:
+    """Check whether argv is `claude attach <job_id or full session id>`."""
+    for i in range(len(argv) - 2):
+        if (
+            os.path.basename(argv[i]) == "claude"
+            and argv[i + 1] == "attach"
+            and argv[i + 2].startswith(job_id)
+        ):
+            return True
+    return False
+
+
+def _get_attached_tmux_window() -> tuple[str, str, str] | None:
+    """Resolve the tmux window whose pane runs `claude attach` for this bg job.
+
+    After /clear (or any new session) inside a daemon session, hooks run
+    without TMUX_PANE, but the window that displays the job still runs
+    `claude attach <job_id>`. Returns (session_name, window_id, window_name).
+    """
+    job_id = _bg_job_id()
+    if not job_id:
+        return None
+
+    result = subprocess.run(
+        [
+            "tmux",
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_pid}:#{session_name}:#{window_id}:#{window_name}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    panes: dict[int, tuple[str, str, str]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split(":", 3)
+        if len(parts) == 4 and parts[0].isdigit():
+            panes[int(parts[0])] = (parts[1], parts[2], parts[3])
+    if not panes:
+        return None
+
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            raw = (proc / "cmdline").read_bytes()
+        except OSError:
+            continue
+        argv = [a.decode(errors="replace") for a in raw.split(b"\0") if a]
+        if not _is_attach_to_job(argv, job_id):
+            continue
+        pid = int(proc.name)
+        for _ in range(8):
+            if pid in panes:
+                logger.debug("bg job %s is attached in pane pid %d", job_id, pid)
+                return panes[pid]
+            pid = _parent_pid(pid)
+            if pid <= 1:
+                break
+    logger.debug("bg job %s is not attached in any tmux pane", job_id)
+    return None
+
+
+def _window_id_for_session(cfg_dir: Path, session_id: str) -> str | None:
+    """Return the window_id bound to session_id in session_map.json, if any."""
+    if not session_id:
+        return None
+    try:
+        session_map = json.loads((cfg_dir / "session_map.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    for key, info in session_map.items():
+        if isinstance(info, dict) and info.get("session_id") == session_id:
+            _, _, window_id = key.partition(":")
+            if window_id.startswith("@"):
+                return window_id
+    return None
+
+
+def _get_tmux_recovery_metadata(target: str) -> dict[str, str]:
+    """Attach live tmux identities so stale hooks cannot confirm a new restore."""
+    result = subprocess.run(
+        [
+            "tmux",
+            "display-message",
+            "-t",
+            target,
+            "-p",
+            "#{@ccbot-instance-id}:#{@ccbot-recovery-token}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    values = result.stdout.strip().split(":")
+    if result.returncode or len(values) != 2:
+        return {}
+    return {
+        key: value
+        for key, value in zip(
+            ("tmux_session_identity", "recovery_token"), values, strict=True
+        )
+        if _UUID_RE.fullmatch(value)
+    }
+
+
 # Minimum seconds between identical event notifications per window
 _NOTIFY_DEBOUNCE_SECS = 5.0
 
@@ -240,12 +378,22 @@ def _notify_telegram(event: str, payload: dict) -> None:
             logger.debug("Skipping idle-nudge Notification (redundant with Stop)")
             return
 
-    window = _get_tmux_window()
-    if window is None:
-        return
-    _, window_id, _ = window
-
     cfg_dir = ccbot_dir()
+
+    window = _get_tmux_window()
+    if window is not None:
+        _, window_id, _ = window
+    else:
+        # Backgrounded sessions (/background) run in the claude daemon
+        # outside tmux; the bot follows them in session_map, so look there,
+        # then at the window running `claude attach` for this job.
+        found = _window_id_for_session(cfg_dir, payload.get("session_id", ""))
+        if found is None:
+            attached = _get_attached_tmux_window()
+            if attached is None:
+                return
+            found = attached[1]
+        window_id = found
 
     # Find the thread binding for this window
     state_file = cfg_dir / "state.json"
@@ -395,14 +543,20 @@ def hook_main() -> None:
         return
 
     # Get tmux session:window key for the pane running this hook.
-    # TMUX_PANE is set by tmux for every process inside a pane.
-    window = _get_tmux_window()
+    # TMUX_PANE is set by tmux for every process inside a pane; bg sessions
+    # in the claude daemon fall back to the window running `claude attach`.
+    window = _get_tmux_window() or _get_attached_tmux_window()
     if window is None:
         logger.warning("Cannot determine tmux window")
         return
     tmux_session_name, window_id, window_name = window
     # Key uses window_id for uniqueness
     session_window_key = f"{tmux_session_name}:{window_id}"
+    recovery_metadata = _get_tmux_recovery_metadata(window_id)
+    if window_name.startswith("__ccbot_recovery_"):
+        token = window_name.removeprefix("__ccbot_recovery_")
+        if _UUID_RE.fullmatch(token):
+            recovery_metadata.setdefault("recovery_token", token)
 
     logger.debug(
         "tmux key=%s, window_name=%s, session_id=%s, cwd=%s",
@@ -437,6 +591,7 @@ def hook_main() -> None:
                     "session_id": session_id,
                     "cwd": cwd,
                     "window_name": window_name,
+                    **recovery_metadata,
                 }
 
                 # Clean up old-format key ("session:window_name") if it exists.
