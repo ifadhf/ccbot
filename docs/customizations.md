@@ -11,13 +11,13 @@ branch.
 
 ## Install and configure
 
-Install the branch that contains these changes using the same account that
-runs tmux and Claude Code. Back up the existing state and transcripts, then stop
+Install the `custom` branch using the same account that runs tmux and Claude
+Code. Back up the existing state and transcripts, then stop
 the bot before installing. The earlier topics and files branch contains version
 4, without recovery.
 
 ```bash
-git clone --branch <branch> https://github.com/ifadhf/ccbot.git
+git clone --branch custom https://github.com/ifadhf/ccbot.git
 cd ccbot
 uv tool install .
 ccbot hook --install
