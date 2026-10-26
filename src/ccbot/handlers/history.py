@@ -4,7 +4,8 @@ Provides history viewing functionality for Claude Code sessions:
   - _build_history_keyboard: Build inline keyboard for page navigation
   - send_history: Send or edit message history with pagination support
 
-Supports both full history and unread message range views.
+Supports both full history and unread message range views. Only the
+conversation text is shown; thinking, tool calls, and tool output are left out.
 """
 
 import logging
@@ -122,6 +123,9 @@ async def send_history(
         _start = TranscriptParser.EXPANDABLE_QUOTE_START
         _end = TranscriptParser.EXPANDABLE_QUOTE_END
 
+        # History shows the conversation only: drop thinking, tool calls,
+        # tool output, and local command output.
+        messages = [m for m in messages if m.get("content_type") == "text"]
         # Filter messages based on config
         if config.show_user_messages:
             # Keep both user and assistant messages
@@ -180,19 +184,15 @@ async def send_history(
 
             # Format message content
             msg_text = msg["text"]
-            content_type = msg.get("content_type", "text")
             msg_role = msg.get("role", "assistant")
 
             # Strip expandable quote sentinels for history view
             msg_text = msg_text.replace(_start, "").replace(_end, "")
 
-            # Add prefix based on role/type
+            # Add prefix based on role
             if msg_role == "user":
                 # User message with emoji prefix (no newline)
                 lines.append(f"👤 {msg_text}")
-            elif content_type == "thinking":
-                # Thinking prefix to match real-time format
-                lines.append(f"∴ Thinking…\n{msg_text}")
             else:
                 lines.append(msg_text)
         full_text = "\n\n".join(lines)
