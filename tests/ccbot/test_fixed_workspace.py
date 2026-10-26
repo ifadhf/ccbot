@@ -45,7 +45,7 @@ def payload(kind="created", topic=42, user_id=111, chat_id=-10011):
 @pytest.fixture
 async def fixed_app(monkeypatch, tmp_path):
     monkeypatch.setattr(bot_module, "prepare_recovery", AsyncMock())
-    workspace = tmp_path / "agrinas"
+    workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setattr(config, "fixed_workdir", workspace)
     monkeypatch.setattr(config, "topic_owner_lock", True)
@@ -66,7 +66,7 @@ async def fixed_app(monkeypatch, tmp_path):
         await asyncio.sleep(0)
         wid = f"@{len(windows) + 1}"
         windows[wid] = SimpleNamespace(window_id=wid, cwd=workdir)
-        return True, "created", window_name or "agrinas", wid
+        return True, "created", window_name or "workspace", wid
 
     async def hook_ready(wid, timeout):
         state = manager.get_window_state(wid)

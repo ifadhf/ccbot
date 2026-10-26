@@ -38,7 +38,7 @@ async def _prepare_state(
     """Checkpoint lost bindings before any code can reuse their tmux IDs."""
     windows = {window.window_id: window for window in await tmux_manager.list_windows()}
     same_instance = manager.tmux_session_identity == identity
-    # One-time migration from agrinas.4: a new tmux session after the last
+    # One-time migration from version 4: a new tmux session after the last
     # saved state cannot be a survivor, even if it recycles IDs/names.
     legacy_survivor = (
         not manager.tmux_session_identity and 0 < created <= manager.loaded_state_mtime

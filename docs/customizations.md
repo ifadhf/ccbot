@@ -1,23 +1,23 @@
-# Agrinas CCBot customizations
+# CCBot customizations
 
-Version `0.1.0+agrinas.5` extends `ifadhf/ccbot` at
+Version `0.1.0+custom.5` extends `ifadhf/ccbot` at
 `f2019b96081a0a7aa75a4478a1ef97c7a26ca84f` (`local-patches`). It supports private
 groups for individual users and a shared group, with an independent Claude
 session for each named Telegram topic.
 
-The recovery update is on `feat/agrinas-session-recovery`, based on commit
-`6d834ca788f39be5c81564136adc9e33ce6034bd` from
-`feat/agrinas-topics-files-workspace`.
+The recovery update builds on commit
+`6d834ca788f39be5c81564136adc9e33ce6034bd` from the earlier topics and files
+branch.
 
 ## Install and configure
 
-Install the recovery branch using the same account that runs tmux and Claude
-Code. Back up the existing state and transcripts, then stop the bot before
-installing. The older `feat/agrinas-topics-files-workspace` branch contains
-`agrinas.4`, without recovery.
+Install the branch that contains these changes using the same account that
+runs tmux and Claude Code. Back up the existing state and transcripts, then stop
+the bot before installing. The earlier topics and files branch contains version
+4, without recovery.
 
 ```bash
-git clone --branch feat/agrinas-session-recovery https://github.com/ifadhf/ccbot.git
+git clone --branch <branch> https://github.com/ifadhf/ccbot.git
 cd ccbot
 uv tool install .
 ccbot hook --install
@@ -116,7 +116,7 @@ If tmux disappears while the bot keeps running, the dispatch and polling paths
 preserve lost bindings before using new window IDs. Use `/recover` in each
 affected topic, or restart the bot later to retry all pending topics.
 
-An existing `agrinas.4` state is accepted without a separate migration file.
+An existing version 4 state is accepted without a separate migration file.
 Legacy windows are retained only when their tmux lifetime, ID, name, directory,
 and Claude process match. Invalid JSON stops startup instead of overwriting
 saved sessions. Back up `state.json`, `session_map.json`, `monitor_state.json`,
