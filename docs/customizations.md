@@ -168,6 +168,28 @@ and report success only after confirmed delivery. The repository's root
 `CLAUDE.md` contains developer instructions for CCBot itself; it is a separate
 file from these runtime instructions.
 
+## Delivery over a flaky connection
+
+When the connection to `api.telegram.org` drops for a few minutes, messages
+are delayed instead of lost:
+
+- Claude output is retried with backoff for about 8 minutes before it is
+  dropped, and later messages wait behind it in order. Status lines and
+  command replies keep a short retry because they are short-lived or block
+  other updates. A timed-out request may already have reached Telegram, so a
+  retry can occasionally duplicate a message.
+- The `Stop` and `Notification` hooks hand the notification to a detached
+  process and return to Claude Code at once. That process retries for about
+  8 minutes and records every attempt in `$CCBOT_DIR/notify.log`.
+- At startup the bot keeps retrying its first Telegram request instead of
+  exiting, and a failure to register the command menu no longer stops it.
+
+A session moved to the background with `/background` stays in its tmux pane:
+Claude Code keeps the original interface there, parked on the background job
+(`parkedJobId` in `~/.claude/sessions/<pid>.json`). The hook maps the job to
+that pane, as it does for a pane running `claude attach <job>`, so a new
+session ID after `/clear` stays bound to its topic.
+
 ## Existing installations
 
 Changing `CCBOT_CHAT_SCOPED_TOPICS` changes the meaning of saved routing keys.
