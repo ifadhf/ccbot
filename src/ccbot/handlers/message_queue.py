@@ -84,6 +84,12 @@ _flood_until: dict[int, float] = {}
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
 
+# Waits between retries when sending Claude output hits a transient network
+# error: about 8 minutes in total, at most 60s apart. Output dropped here
+# never reaches the topic, and the connection to api.telegram.org can drop
+# for a minute or more. Later tasks stay queued in order while this waits.
+CONTENT_RETRY_DELAYS: tuple[float, ...] = (2.0, 5.0, 10.0, 20.0, 30.0) + (60.0,) * 7
+
 
 def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
     """Get the message queue for a user (if exists)."""
@@ -412,11 +418,19 @@ async def _process_content_task(bot: Bot, user_id: int, task: MessageTask) -> No
             bot,
             chat_id,
             part,
+            retry_delays=CONTENT_RETRY_DELAYS,
             **_send_kwargs(task.thread_id),  # type: ignore[arg-type]
         )
 
         if sent:
             last_msg_id = sent.message_id
+        else:
+            logger.error(
+                "Dropped content for window %s (thread %s, %d chars)",
+                wid,
+                task.thread_id,
+                len(part),
+            )
 
     # 3. Record tool_use message ID for later editing
     if last_msg_id and task.tool_use_id and task.content_type == "tool_use":
