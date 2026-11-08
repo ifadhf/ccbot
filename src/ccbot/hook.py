@@ -209,12 +209,78 @@ def _is_attach_to_job(argv: list[str], job_id: str) -> bool:
     return False
 
 
-def _get_attached_tmux_window() -> tuple[str, str, str] | None:
-    """Resolve the tmux window whose pane runs `claude attach` for this bg job.
+def _proc_matches(pid: int, proc_start: object) -> bool:
+    """Check that pid is alive and, when known, started at proc_start.
 
-    After /clear (or any new session) inside a daemon session, hooks run
-    without TMUX_PANE, but the window that displays the job still runs
-    `claude attach <job_id>`. Returns (session_name, window_id, window_name).
+    ~/.claude/sessions/<pid>.json records the process start time in clock
+    ticks ("procStart", field 22 of /proc/<pid>/stat). Comparing it keeps a
+    stale file from matching an unrelated process that reused the pid.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    if not isinstance(proc_start, str) or not proc_start.isdigit():
+        return True
+    try:
+        # comm (field 2) may contain spaces and parens; fields 3+ follow it.
+        return stat.rsplit(")", 1)[1].split()[19] == proc_start
+    except IndexError:
+        return False
+
+
+def _parked_viewer_pids(job_id: str) -> list[int]:
+    """Return pids of interactive Claude processes parked on bg job job_id.
+
+    Since Claude Code 2.1.31x, /background keeps the original TUI running
+    in its tmux pane as a viewer of the daemon job. Instead of exec'ing
+    `claude attach <job>`, it records the job as "parkedJobId" in its own
+    ~/.claude/sessions/<pid>.json.
+    """
+    sessions_dir = Path.home() / ".claude" / "sessions"
+    pids: list[int] = []
+    try:
+        files = sorted(sessions_dir.glob("*.json"))
+    except OSError:
+        return pids
+    for path in files:
+        try:
+            info = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(info, dict) or info.get("parkedJobId") != job_id:
+            continue
+        pid = info.get("pid")
+        if (
+            isinstance(pid, int)
+            and pid > 1
+            and _proc_matches(pid, info.get("procStart"))
+        ):
+            pids.append(pid)
+    return pids
+
+
+def _pane_for_pid(
+    pid: int, panes: dict[int, tuple[str, str, str]]
+) -> tuple[str, str, str] | None:
+    """Walk up from pid to the tmux pane process that contains it."""
+    for _ in range(8):
+        if pid in panes:
+            return panes[pid]
+        pid = _parent_pid(pid)
+        if pid <= 1:
+            break
+    return None
+
+
+def _get_attached_tmux_window() -> tuple[str, str, str] | None:
+    """Resolve the tmux window that displays this hook's bg job.
+
+    After /background, /clear, or any new session inside a daemon session,
+    hooks run without TMUX_PANE. The window that displays the job either
+    still runs the original TUI parked on the job (current Claude Code) or
+    runs `claude attach <job_id>` (older versions, or a manual attach).
+    Returns (session_name, window_id, window_name).
     """
     job_id = _bg_job_id()
     if not job_id:
@@ -239,6 +305,12 @@ def _get_attached_tmux_window() -> tuple[str, str, str] | None:
     if not panes:
         return None
 
+    for pid in _parked_viewer_pids(job_id):
+        found = _pane_for_pid(pid, panes)
+        if found is not None:
+            logger.debug("bg job %s is parked in a TUI under pane %s", job_id, found)
+            return found
+
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit():
             continue
@@ -249,14 +321,10 @@ def _get_attached_tmux_window() -> tuple[str, str, str] | None:
         argv = [a.decode(errors="replace") for a in raw.split(b"\0") if a]
         if not _is_attach_to_job(argv, job_id):
             continue
-        pid = int(proc.name)
-        for _ in range(8):
-            if pid in panes:
-                logger.debug("bg job %s is attached in pane pid %d", job_id, pid)
-                return panes[pid]
-            pid = _parent_pid(pid)
-            if pid <= 1:
-                break
+        found = _pane_for_pid(int(proc.name), panes)
+        if found is not None:
+            logger.debug("bg job %s is attached in pane %s", job_id, found)
+            return found
     logger.debug("bg job %s is not attached in any tmux pane", job_id)
     return None
 
@@ -386,7 +454,7 @@ def _notify_telegram(event: str, payload: dict) -> None:
     else:
         # Backgrounded sessions (/background) run in the claude daemon
         # outside tmux; the bot follows them in session_map, so look there,
-        # then at the window running `claude attach` for this job.
+        # then at the window whose TUI is parked on (or attached to) the job.
         found = _window_id_for_session(cfg_dir, payload.get("session_id", ""))
         if found is None:
             attached = _get_attached_tmux_window()

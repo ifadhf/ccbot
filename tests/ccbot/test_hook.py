@@ -224,3 +224,60 @@ class TestBgSessionWindow:
             "tmux_session_identity": "11111111-2222-4333-8444-555555555555",
         }
         assert targets == ["@9"]
+
+
+class TestParkedBgSession:
+    """Current Claude Code parks the original TUI on the bg job it shows."""
+
+    def _write_session(self, tmp_path, pid: int, **fields) -> None:
+        sessions = tmp_path / ".claude" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / f"{pid}.json").write_text(json.dumps({"pid": pid, **fields}))
+
+    def test_attached_window_resolves_parked_tui(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # Pane 500 runs a shell; its child 600 is the TUI parked on job 96396cb7.
+        self._write_session(
+            tmp_path,
+            600,
+            sessionId="ea92b85f",
+            kind="interactive",
+            parkedJobId="96396cb7",
+        )
+        self._write_session(
+            tmp_path, 700, sessionId="96396cb7", kind="bg", jobId="96396cb7"
+        )
+        monkeypatch.setattr(hook_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(hook_module, "_bg_job_id", lambda: "96396cb7")
+        monkeypatch.setattr(hook_module, "_proc_matches", lambda pid, start: True)
+        monkeypatch.setattr(hook_module, "_parent_pid", {600: 500}.get)
+
+        class Result:
+            stdout = "400:ccbot:@15:other\n500:ccbot:@16:android-app\n"
+
+        monkeypatch.setattr(hook_module.subprocess, "run", lambda *a, **k: Result())
+        assert hook_module._get_attached_tmux_window() == (
+            "ccbot",
+            "@16",
+            "android-app",
+        )
+
+    def test_parked_viewer_skips_other_jobs_and_dead_processes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        self._write_session(tmp_path, 600, parkedJobId="aaaaaaaa")
+        self._write_session(tmp_path, 601, parkedJobId="96396cb7")
+        self._write_session(tmp_path, 602, parkedJobId="96396cb7")
+        monkeypatch.setattr(hook_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(hook_module, "_proc_matches", lambda pid, start: pid == 602)
+        assert hook_module._parked_viewer_pids("96396cb7") == [602]
+
+    def test_proc_matches_checks_start_time(self) -> None:
+        pid = hook_module.os.getpid()
+        stat = hook_module.Path(f"/proc/{pid}/stat").read_text()
+        start = stat.rsplit(")", 1)[1].split()[19]
+        assert hook_module._proc_matches(pid, start)
+        assert hook_module._proc_matches(pid, None)
+        assert not hook_module._proc_matches(pid, str(int(start) + 1))
+        assert not hook_module._proc_matches(2**22 + 12345, None)
