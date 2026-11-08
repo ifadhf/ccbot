@@ -127,6 +127,7 @@ from .handlers.message_queue import (
 )
 from .handlers.message_sender import (
     NO_LINK_PREVIEW,
+    is_transient_network_error,
     safe_edit,
     safe_reply,
     safe_send,
@@ -2314,32 +2315,15 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 async def post_init(application: Application) -> None:
     global session_monitor, _status_poll_task
 
-    await application.bot.delete_my_commands()
-
-    bot_commands = [
-        BotCommand("start", "Show welcome message"),
-        BotCommand("history", "Message history for this topic"),
-        BotCommand("screenshot", "Terminal screenshot with control keys"),
-        BotCommand("esc", "Send Escape to interrupt Claude"),
-        BotCommand("kill", "Kill session and delete topic"),
-        BotCommand("mode", "Cycle permission mode (Shift+Tab)"),
-        BotCommand("unbind", "Unbind topic from session (keeps window running)"),
-        BotCommand("usage", "Show Claude Code usage remaining"),
-    ]
-    if config.session_recovery:
-        bot_commands.insert(
-            -1, BotCommand("recover", "Resume this topic's saved conversation")
-        )
-    # Add Claude Code slash commands
-    for cmd_name, desc in CC_COMMANDS.items():
-        bot_commands.append(BotCommand(cmd_name, desc))
-
-    await application.bot.set_my_commands(bot_commands)
-    # Also register under the group-chats scope: group clients check this
-    # scope first and may not fall back to default until their cache expires
-    await application.bot.set_my_commands(
-        bot_commands, scope=BotCommandScopeAllGroupChats()
-    )
+    try:
+        await _register_bot_commands(application)
+    except TelegramError as e:
+        # The command menu is cosmetic and a failed update keeps the previous
+        # one, so a flaky connection must not abort startup and restart-loop
+        # the bot.
+        if not is_transient_network_error(e):
+            raise
+        logger.warning("Could not register bot commands, continuing: %s", e)
 
     # Restore from state.json before any cleanup can discard lost bindings.
     await recover_sessions(session_manager)
@@ -2369,6 +2353,39 @@ async def post_init(application: Application) -> None:
     # Start status polling task
     _status_poll_task = asyncio.create_task(status_poll_loop(application.bot))
     logger.info("Status polling task started")
+
+
+async def _register_bot_commands(application: Application) -> None:
+    """Publish the command menu for private and group chats.
+
+    setMyCommands replaces a scope's whole list, so a failed call leaves the
+    previous menu in place. Deleting the list first would leave no menu at
+    all whenever the set that follows fails.
+    """
+    bot_commands = [
+        BotCommand("start", "Show welcome message"),
+        BotCommand("history", "Message history for this topic"),
+        BotCommand("screenshot", "Terminal screenshot with control keys"),
+        BotCommand("esc", "Send Escape to interrupt Claude"),
+        BotCommand("kill", "Kill session and delete topic"),
+        BotCommand("mode", "Cycle permission mode (Shift+Tab)"),
+        BotCommand("unbind", "Unbind topic from session (keeps window running)"),
+        BotCommand("usage", "Show Claude Code usage remaining"),
+    ]
+    if config.session_recovery:
+        bot_commands.insert(
+            -1, BotCommand("recover", "Resume this topic's saved conversation")
+        )
+    # Add Claude Code slash commands
+    for cmd_name, desc in CC_COMMANDS.items():
+        bot_commands.append(BotCommand(cmd_name, desc))
+
+    await application.bot.set_my_commands(bot_commands)
+    # Also register under the group-chats scope: group clients check this
+    # scope first and may not fall back to default until their cache expires
+    await application.bot.set_my_commands(
+        bot_commands, scope=BotCommandScopeAllGroupChats()
+    )
 
 
 async def post_shutdown(application: Application) -> None:
