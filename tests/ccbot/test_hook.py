@@ -281,3 +281,102 @@ class TestParkedBgSession:
         assert hook_module._proc_matches(pid, None)
         assert not hook_module._proc_matches(pid, str(int(start) + 1))
         assert not hook_module._proc_matches(2**22 + 12345, None)
+
+
+class TestNotificationDelivery:
+    """Stop/Notification messages survive a flaky Telegram connection."""
+
+    @pytest.fixture
+    def sleeps(self, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        recorded: list[float] = []
+        monkeypatch.setattr("time.sleep", recorded.append)
+        return recorded
+
+    @staticmethod
+    def _http_error(code: int, body: dict):
+        import urllib.error
+
+        return urllib.error.HTTPError(
+            "https://api.telegram.org/botSECRET/sendMessage",
+            code,
+            "error",
+            {},  # type: ignore[arg-type]
+            io.BytesIO(json.dumps(body).encode()),
+        )
+
+    def test_retries_transient_errors_until_sent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, sleeps
+    ) -> None:
+        import urllib.error
+        from unittest.mock import MagicMock
+
+        urlopen = MagicMock(
+            side_effect=[
+                TimeoutError("The read operation timed out"),
+                urllib.error.URLError("Temporary failure in name resolution"),
+                MagicMock(),
+            ]
+        )
+        monkeypatch.setattr("urllib.request.urlopen", urlopen)
+        assert hook_module._post_with_retry("SECRET", b"x=1", "Stop @1", tmp_path)
+        assert urlopen.call_count == 3
+        assert sleeps == list(hook_module._NOTIFY_RETRY_DELAYS[:2])
+        log = (tmp_path / "notify.log").read_text()
+        assert "Stop @1: sent" in log
+        assert "SECRET" not in log
+
+    def test_gives_up_after_all_attempts(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, sleeps
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        urlopen = MagicMock(side_effect=TimeoutError("timed out"))
+        monkeypatch.setattr("urllib.request.urlopen", urlopen)
+        assert not hook_module._post_with_retry("SECRET", b"x=1", "Stop @1", tmp_path)
+        assert urlopen.call_count == len(hook_module._NOTIFY_RETRY_DELAYS) + 1
+        assert "gave up" in (tmp_path / "notify.log").read_text()
+
+    def test_permanent_rejection_is_not_retried(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, sleeps
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        error = self._http_error(
+            400, {"description": "Bad Request: message thread not found"}
+        )
+        urlopen = MagicMock(side_effect=error)
+        monkeypatch.setattr("urllib.request.urlopen", urlopen)
+        assert not hook_module._post_with_retry("SECRET", b"x=1", "Stop @1", tmp_path)
+        assert urlopen.call_count == 1
+        assert sleeps == []
+        log = (tmp_path / "notify.log").read_text()
+        assert "message thread not found" in log
+        assert "SECRET" not in log
+
+    def test_flood_control_waits_retry_after(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, sleeps
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        error = self._http_error(
+            429, {"description": "Too Many Requests", "parameters": {"retry_after": 7}}
+        )
+        urlopen = MagicMock(side_effect=[error, MagicMock()])
+        monkeypatch.setattr("urllib.request.urlopen", urlopen)
+        assert hook_module._post_with_retry("SECRET", b"x=1", "Stop @1", tmp_path)
+        assert sleeps == [7.0]
+
+    def test_hook_detaches_stop_delivery(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from unittest.mock import MagicMock
+
+        notify = MagicMock()
+        monkeypatch.setattr(hook_module, "_notify_telegram", notify)
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        payload = {
+            "session_id": "22222222-3333-4444-8555-666666666666",
+            "cwd": "/home/u/project",
+            "hook_event_name": "Stop",
+        }
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        hook_main()
+        notify.assert_called_once_with("Stop", payload, detach=True)

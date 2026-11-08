@@ -374,6 +374,18 @@ def _get_tmux_recovery_metadata(target: str) -> dict[str, str]:
 # Minimum seconds between identical event notifications per window
 _NOTIFY_DEBOUNCE_SECS = 5.0
 
+# Per-attempt HTTP timeout for a notification, and the waits before each
+# retry. Retries run in a detached child (see _detach), so their total
+# duration is not bounded by the hook timeout in settings.json. About 8
+# minutes of waiting in total, like the bot's retries for Claude output, so
+# a notification survives the same outages as the reply it announces.
+_NOTIFY_HTTP_TIMEOUT = 15.0
+_NOTIFY_RETRY_DELAYS: tuple[float, ...] = (3.0, 10.0, 30.0, 60.0, 120.0, 240.0)
+
+# Delivery outcomes go to <ccbot_dir>/notify.log because Claude Code drops
+# the stderr of a hook that exits 0. Rotated once it exceeds this size.
+_NOTIFY_LOG_MAX_BYTES = 512 * 1024
+
 
 def _read_bot_token(ccbot_dir_path: Path) -> str:
     """Read TELEGRAM_BOT_TOKEN from env or <ccbot_dir>/.env (no config import)."""
@@ -424,16 +436,174 @@ def _get_user_mention(user_id: str, token: str, cfg_dir: Path) -> str:
     return f'<a href="tg://user?id={user_id}">{html.escape(label)}</a>'
 
 
-def _notify_telegram(event: str, payload: dict) -> None:
+def _log_notify(cfg_dir: Path, message: str) -> None:
+    """Record a notification outcome in <ccbot_dir>/notify.log and the logger."""
+    import time
+
+    logger.info("%s", message)
+    log_file = cfg_dir / "notify.log"
+    try:
+        if log_file.stat().st_size > _NOTIFY_LOG_MAX_BYTES:
+            log_file.replace(log_file.with_name("notify.log.1"))
+    except OSError:
+        pass
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{os.getpid()}] {message}\n"
+    try:
+        fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def _telegram_error_detail(error: Exception) -> tuple[str, int | None]:
+    """Return (description, retry_after) from a Bot API HTTP error body."""
+    try:
+        body = json.loads(error.read().decode(errors="replace"))  # type: ignore[attr-defined]
+    except Exception:
+        return "", None
+    if not isinstance(body, dict):
+        return "", None
+    description = str(body.get("description", ""))[:200]
+    params = body.get("parameters")
+    retry_after = params.get("retry_after") if isinstance(params, dict) else None
+    return description, retry_after if isinstance(retry_after, int) else None
+
+
+def _post_with_retry(token: str, data: bytes, label: str, cfg_dir: Path) -> bool:
+    """POST sendMessage, retrying timeouts, network errors, 429 and 5xx.
+
+    Other 4xx responses are permanent (bad chat or topic) and are not
+    retried. Returns True once Telegram accepts the message.
+    """
+    import time
+    import urllib.error
+    import urllib.request
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    attempts = len(_NOTIFY_RETRY_DELAYS) + 1
+    for attempt, delay in enumerate((*_NOTIFY_RETRY_DELAYS, None), start=1):
+        try:
+            with urllib.request.urlopen(
+                urllib.request.Request(url, data=data), timeout=_NOTIFY_HTTP_TIMEOUT
+            ) as resp:
+                _log_notify(
+                    cfg_dir,
+                    f"{label}: sent (HTTP {resp.status}, attempt {attempt}/{attempts})",
+                )
+                return True
+        except urllib.error.HTTPError as e:
+            description, retry_after = _telegram_error_detail(e)
+            if e.code != 429 and e.code < 500:
+                _log_notify(cfg_dir, f"{label}: rejected (HTTP {e.code} {description})")
+                return False
+            error = f"HTTP {e.code} {description}".strip()
+            if delay is not None and retry_after:
+                delay = max(delay, float(retry_after))
+        except Exception as e:  # timeouts, resets, DNS and TLS failures
+            # Never let the token reach the log, whatever the error text holds.
+            error = f"{type(e).__name__}: {e}".replace(token, "***")[:200]
+        if delay is None:
+            _log_notify(
+                cfg_dir, f"{label}: gave up after {attempts} attempts ({error})"
+            )
+            return False
+        _log_notify(
+            cfg_dir,
+            f"{label}: attempt {attempt}/{attempts} failed ({error}), "
+            f"retrying in {delay:.0f}s",
+        )
+        time.sleep(delay)
+    return False
+
+
+def _detach() -> bool:
+    """Fork so delivery can outlive the hook; return True in the child.
+
+    Claude Code waits for the hook and kills it at the settings.json
+    timeout, which is too short to ride out a slow or flaky Telegram
+    connection. The child starts its own session and swaps the inherited
+    stdio pipes for /dev/null, so Claude Code sees the hook finish as soon
+    as the parent exits. If fork fails, deliver inline instead.
+    """
+    try:
+        pid = os.fork()
+    except OSError:
+        return True
+    if pid:
+        return False
+    os.setsid()
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    if devnull > 2:
+        os.close(devnull)
+    return True
+
+
+def _deliver_notification(
+    cfg_dir: Path,
+    state: dict,
+    event: str,
+    window_id: str,
+    target: tuple[int, int, str],
+) -> None:
+    """Build the notification text for target and send it with retries."""
+    import urllib.parse
+
+    chat_id, thread_id, user_id = target
+    label = f"{event} {window_id} -> thread {thread_id}"
+
+    token = _read_bot_token(cfg_dir)
+    if not token:
+        logger.warning("No TELEGRAM_BOT_TOKEN available, cannot notify")
+        _log_notify(cfg_dir, f"{label}: no bot token, skipped")
+        return
+
+    owner = state.get("topic_owners", {}).get(f"{chat_id}:{thread_id}", {})
+    if isinstance(owner.get("user_id"), int) and owner["user_id"] > 0:
+        name = (
+            ("@" + owner["username"])
+            if owner.get("username")
+            else owner.get("first_name", "pemilik")
+        )
+        mention = f'<a href="tg://user?id={owner["user_id"]}">{html.escape(name)}</a>'
+    else:
+        # Legacy private bindings identify a user; shared group IDs do not.
+        mention = _get_user_mention(user_id, token, cfg_dir) if int(user_id) > 0 else ""
+    if event == "Stop":
+        text = f"✅ Task selesai — menunggu input {mention}".rstrip()
+    else:  # Notification
+        # Always generic: the real payload message (e.g. "Claude needs your
+        # permission") is misleading for non-risky prompts like AskUserQuestion,
+        # which also fires notification_type=permission_prompt.
+        text = "🔔 Claude needs your attention"
+        if mention:
+            text += f" — {mention}"
+
+    data = urllib.parse.urlencode(
+        {
+            "chat_id": chat_id,
+            "message_thread_id": thread_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_notification": "false",
+        }
+    ).encode()
+    _post_with_retry(token, data, label, cfg_dir)
+
+
+def _notify_telegram(event: str, payload: dict, detach: bool = False) -> None:
     """Send a direct Telegram notification for Stop/Notification hook events.
 
     Resolves this pane's window to its bound Telegram topic via state.json,
     then calls sendMessage over HTTPS. Silent no-op when the window is not
     bound to any topic (e.g. Claude sessions outside ccbot).
+
+    With detach=True (the real hook), delivery and its retries run in a
+    detached child process so they do not hold up Claude Code.
     """
     import time
-    import urllib.parse
-    import urllib.request
 
     from .utils import atomic_write_json, ccbot_dir
 
@@ -484,7 +654,6 @@ def _notify_telegram(event: str, payload: dict) -> None:
     if target is None:
         logger.debug("Window %s not bound to a topic, skipping", window_id)
         return
-    chat_id, thread_id, user_id = target
 
     # Debounce identical event notifications per window
     debounce_file = cfg_dir / "notify_debounce.json"
@@ -506,49 +675,13 @@ def _notify_telegram(event: str, payload: dict) -> None:
     except OSError:
         pass
 
-    token = _read_bot_token(cfg_dir)
-    if not token:
-        logger.warning("No TELEGRAM_BOT_TOKEN available, cannot notify")
-        return
-
-    owner = state.get("topic_owners", {}).get(f"{chat_id}:{thread_id}", {})
-    if isinstance(owner.get("user_id"), int) and owner["user_id"] > 0:
-        label = (
-            ("@" + owner["username"])
-            if owner.get("username")
-            else owner.get("first_name", "pemilik")
-        )
-        mention = f'<a href="tg://user?id={owner["user_id"]}">{html.escape(label)}</a>'
-    else:
-        # Legacy private bindings identify a user; shared group IDs do not.
-        mention = _get_user_mention(user_id, token, cfg_dir) if int(user_id) > 0 else ""
-    if event == "Stop":
-        text = f"✅ Task selesai — menunggu input {mention}".rstrip()
-    else:  # Notification
-        # Always generic: the real payload message (e.g. "Claude needs your
-        # permission") is misleading for non-risky prompts like AskUserQuestion,
-        # which also fires notification_type=permission_prompt.
-        text = "🔔 Claude needs your attention"
-        if mention:
-            text += f" — {mention}"
-
-    data = urllib.parse.urlencode(
-        {
-            "chat_id": chat_id,
-            "message_thread_id": thread_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_notification": "false",
-        }
-    ).encode()
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    if detach and not _detach():
+        return  # parent: hand control back to Claude Code right away
     try:
-        with urllib.request.urlopen(
-            urllib.request.Request(url, data=data), timeout=6
-        ) as resp:
-            logger.info("Sent %s notification (HTTP %s)", event, resp.status)
-    except Exception as e:
-        logger.warning("Failed to send %s notification (%s)", event, type(e).__name__)
+        _deliver_notification(cfg_dir, state, event, window_id, target)
+    finally:
+        if detach:
+            os._exit(0)
 
 
 def hook_main() -> None:
@@ -603,7 +736,7 @@ def hook_main() -> None:
         return
 
     if event in ("Stop", "Notification"):
-        _notify_telegram(event, payload)
+        _notify_telegram(event, payload, detach=True)
         return
 
     if event != "SessionStart":
