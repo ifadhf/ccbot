@@ -224,3 +224,159 @@ class TestBgSessionWindow:
             "tmux_session_identity": "11111111-2222-4333-8444-555555555555",
         }
         assert targets == ["@9"]
+
+
+class TestParkedBgSession:
+    """Current Claude Code parks the original TUI on the bg job it shows."""
+
+    def _write_session(self, tmp_path, pid: int, **fields) -> None:
+        sessions = tmp_path / ".claude" / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        (sessions / f"{pid}.json").write_text(json.dumps({"pid": pid, **fields}))
+
+    def test_attached_window_resolves_parked_tui(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        # Pane 500 runs a shell; its child 600 is the TUI parked on job 96396cb7.
+        self._write_session(
+            tmp_path,
+            600,
+            sessionId="ea92b85f",
+            kind="interactive",
+            parkedJobId="96396cb7",
+        )
+        self._write_session(
+            tmp_path, 700, sessionId="96396cb7", kind="bg", jobId="96396cb7"
+        )
+        monkeypatch.setattr(hook_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(hook_module, "_bg_job_id", lambda: "96396cb7")
+        monkeypatch.setattr(hook_module, "_proc_matches", lambda pid, start: True)
+        monkeypatch.setattr(hook_module, "_parent_pid", {600: 500}.get)
+
+        class Result:
+            stdout = "400:ccbot:@15:other\n500:ccbot:@16:android-app\n"
+
+        monkeypatch.setattr(hook_module.subprocess, "run", lambda *a, **k: Result())
+        assert hook_module._get_attached_tmux_window() == (
+            "ccbot",
+            "@16",
+            "android-app",
+        )
+
+    def test_parked_viewer_skips_other_jobs_and_dead_processes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path
+    ) -> None:
+        self._write_session(tmp_path, 600, parkedJobId="aaaaaaaa")
+        self._write_session(tmp_path, 601, parkedJobId="96396cb7")
+        self._write_session(tmp_path, 602, parkedJobId="96396cb7")
+        monkeypatch.setattr(hook_module.Path, "home", lambda: tmp_path)
+        monkeypatch.setattr(hook_module, "_proc_matches", lambda pid, start: pid == 602)
+        assert hook_module._parked_viewer_pids("96396cb7") == [602]
+
+    def test_proc_matches_checks_start_time(self) -> None:
+        pid = hook_module.os.getpid()
+        stat = hook_module.Path(f"/proc/{pid}/stat").read_text()
+        start = stat.rsplit(")", 1)[1].split()[19]
+        assert hook_module._proc_matches(pid, start)
+        assert hook_module._proc_matches(pid, None)
+        assert not hook_module._proc_matches(pid, str(int(start) + 1))
+        assert not hook_module._proc_matches(2**22 + 12345, None)
+
+
+class TestNotificationDelivery:
+    """Stop/Notification messages survive a flaky Telegram connection."""
+
+    @pytest.fixture
+    def sleeps(self, monkeypatch: pytest.MonkeyPatch) -> list[float]:
+        recorded: list[float] = []
+        monkeypatch.setattr("time.sleep", recorded.append)
+        return recorded
+
+    @staticmethod
+    def _http_error(code: int, body: dict):
+        import urllib.error
+
+        return urllib.error.HTTPError(
+            "https://api.telegram.org/botSECRET/sendMessage",
+            code,
+            "error",
+            {},  # type: ignore[arg-type]
+            io.BytesIO(json.dumps(body).encode()),
+        )
+
+    def test_retries_transient_errors_until_sent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, sleeps
+    ) -> None:
+        import urllib.error
+        from unittest.mock import MagicMock
+
+        urlopen = MagicMock(
+            side_effect=[
+                TimeoutError("The read operation timed out"),
+                urllib.error.URLError("Temporary failure in name resolution"),
+                MagicMock(),
+            ]
+        )
+        monkeypatch.setattr("urllib.request.urlopen", urlopen)
+        assert hook_module._post_with_retry("SECRET", b"x=1", "Stop @1", tmp_path)
+        assert urlopen.call_count == 3
+        assert sleeps == list(hook_module._NOTIFY_RETRY_DELAYS[:2])
+        log = (tmp_path / "notify.log").read_text()
+        assert "Stop @1: sent" in log
+        assert "SECRET" not in log
+
+    def test_gives_up_after_all_attempts(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, sleeps
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        urlopen = MagicMock(side_effect=TimeoutError("timed out"))
+        monkeypatch.setattr("urllib.request.urlopen", urlopen)
+        assert not hook_module._post_with_retry("SECRET", b"x=1", "Stop @1", tmp_path)
+        assert urlopen.call_count == len(hook_module._NOTIFY_RETRY_DELAYS) + 1
+        assert "gave up" in (tmp_path / "notify.log").read_text()
+
+    def test_permanent_rejection_is_not_retried(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, sleeps
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        error = self._http_error(
+            400, {"description": "Bad Request: message thread not found"}
+        )
+        urlopen = MagicMock(side_effect=error)
+        monkeypatch.setattr("urllib.request.urlopen", urlopen)
+        assert not hook_module._post_with_retry("SECRET", b"x=1", "Stop @1", tmp_path)
+        assert urlopen.call_count == 1
+        assert sleeps == []
+        log = (tmp_path / "notify.log").read_text()
+        assert "message thread not found" in log
+        assert "SECRET" not in log
+
+    def test_flood_control_waits_retry_after(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path, sleeps
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        error = self._http_error(
+            429, {"description": "Too Many Requests", "parameters": {"retry_after": 7}}
+        )
+        urlopen = MagicMock(side_effect=[error, MagicMock()])
+        monkeypatch.setattr("urllib.request.urlopen", urlopen)
+        assert hook_module._post_with_retry("SECRET", b"x=1", "Stop @1", tmp_path)
+        assert sleeps == [7.0]
+
+    def test_hook_detaches_stop_delivery(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from unittest.mock import MagicMock
+
+        notify = MagicMock()
+        monkeypatch.setattr(hook_module, "_notify_telegram", notify)
+        monkeypatch.setattr(sys, "argv", ["ccbot", "hook"])
+        payload = {
+            "session_id": "22222222-3333-4444-8555-666666666666",
+            "cwd": "/home/u/project",
+            "hook_event_name": "Stop",
+        }
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        hook_main()
+        notify.assert_called_once_with("Stop", payload, detach=True)

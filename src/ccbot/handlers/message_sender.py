@@ -14,14 +14,19 @@ Functions:
 
 Rate limiting is handled globally by AIORateLimiter on the Application.
 RetryAfter exceptions are re-raised so callers (queue worker) can handle them.
+Transient network errors (timeouts, connection resets, DNS failures) are
+retried before a send gives up: briefly by default, longer when the caller
+passes its own retry_delays (the queue worker does this for Claude output).
 """
 
+import asyncio
 import io
 import logging
-from typing import Any
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any, TypeVar
 
 from telegram import Bot, InputMediaPhoto, LinkPreviewOptions, Message
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter
 
 from ..markdown_v2 import convert_markdown
 from ..transcript_parser import TranscriptParser
@@ -50,38 +55,107 @@ PARSE_MODE = "MarkdownV2"
 # Disable link previews in all messages to reduce visual noise
 NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
+# Default seconds to wait before each retry of a send that hit a transient
+# network error, so a send makes len(NETWORK_RETRY_DELAYS) + 1 attempts in
+# total. Kept short because handlers that reply to the user block update
+# processing while they wait.
+NETWORK_RETRY_DELAYS: tuple[float, ...] = (2.0, 5.0)
+
+_T = TypeVar("_T")
+
+
+def is_transient_network_error(exc: BaseException) -> bool:
+    """Return True for transport failures that are worth retrying.
+
+    PTB derives BadRequest from NetworkError, but Telegram rejects the same
+    request the same way every time, so BadRequest is not transient.
+    """
+    return isinstance(exc, NetworkError) and not isinstance(exc, BadRequest)
+
+
+async def _retry_transient(
+    call: Callable[[], Awaitable[_T]],
+    what: str,
+    delays: Sequence[float] | None = None,
+) -> _T:
+    """Await call(), retrying transient network errors after each delay.
+
+    delays defaults to NETWORK_RETRY_DELAYS. A timeout can fire after
+    Telegram has already accepted the request, so a retry may duplicate a
+    message. A duplicate is preferred over losing Claude output.
+    """
+    if delays is None:
+        delays = NETWORK_RETRY_DELAYS
+    attempts = len(delays) + 1
+    for attempt, delay in enumerate((*delays, None), start=1):
+        try:
+            return await call()
+        except Exception as e:
+            if delay is None or not is_transient_network_error(e):
+                raise
+            logger.warning(
+                "%s failed (%s), retrying in %.0fs (attempt %d/%d)",
+                what,
+                e,
+                delay,
+                attempt,
+                attempts,
+            )
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
+
 
 async def send_with_fallback(
     bot: Bot,
     chat_id: int,
     text: str,
+    *,
+    retry_delays: Sequence[float] | None = None,
     **kwargs: Any,
 ) -> Message | None:
     """Send message with MarkdownV2, falling back to plain text on failure.
+
+    Transient network errors are retried first, waiting retry_delays
+    (default NETWORK_RETRY_DELAYS) between attempts. Plain text is only
+    tried when the formatted message fails for another reason (e.g.
+    Telegram rejects the MarkdownV2), because resending as plain text
+    cannot fix a network problem and only adds duplicates.
 
     Returns the sent Message on success, None on failure.
     RetryAfter is re-raised for caller handling.
     """
     kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     try:
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=_ensure_formatted(text),
-            parse_mode=PARSE_MODE,
-            **kwargs,
+        formatted = _ensure_formatted(text)
+        return await _retry_transient(
+            lambda: bot.send_message(
+                chat_id=chat_id,
+                text=formatted,
+                parse_mode=PARSE_MODE,
+                **kwargs,
+            ),
+            f"Send to {chat_id}",
+            retry_delays,
         )
     except RetryAfter:
         raise
-    except Exception:
-        try:
-            return await bot.send_message(
-                chat_id=chat_id, text=strip_sentinels(text), **kwargs
-            )
-        except RetryAfter:
-            raise
-        except Exception as e:
+    except Exception as e:
+        if is_transient_network_error(e):
             logger.error(f"Failed to send message to {chat_id}: {e}")
             return None
+    try:
+        return await _retry_transient(
+            lambda: bot.send_message(
+                chat_id=chat_id, text=strip_sentinels(text), **kwargs
+            ),
+            f"Plain-text send to {chat_id}",
+            retry_delays,
+        )
+    except RetryAfter:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to send message to {chat_id}: {e}")
+        return None
 
 
 async def send_photo(
@@ -175,24 +249,6 @@ async def safe_send(
     **kwargs: Any,
 ) -> None:
     """Send message with formatting, falling back to plain text on failure."""
-    kwargs.setdefault("link_preview_options", NO_LINK_PREVIEW)
     if message_thread_id is not None:
         kwargs.setdefault("message_thread_id", message_thread_id)
-    try:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=_ensure_formatted(text),
-            parse_mode=PARSE_MODE,
-            **kwargs,
-        )
-    except RetryAfter:
-        raise
-    except Exception:
-        try:
-            await bot.send_message(
-                chat_id=chat_id, text=strip_sentinels(text), **kwargs
-            )
-        except RetryAfter:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to send message to {chat_id}: {e}")
+    await send_with_fallback(bot, chat_id, text, **kwargs)

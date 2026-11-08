@@ -73,7 +73,12 @@ def main() -> None:
     from .bot import create_bot
 
     application = create_bot()
-    application.run_polling(allowed_updates=["message", "callback_query"])
+    # bootstrap_retries=-1: keep retrying the startup getMe on network errors
+    # instead of exiting on the first timeout and restart-looping under
+    # systemd while the connection to Telegram is flaky.
+    application.run_polling(
+        allowed_updates=["message", "callback_query"], bootstrap_retries=-1
+    )
 
 
 if __name__ == "__main__":
