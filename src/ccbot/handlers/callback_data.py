@@ -10,6 +10,7 @@ Constants:
   - CB_SCREENSHOT_*: Screenshot refresh
   - CB_ASK_*: Interactive UI navigation (arrows, enter, esc)
   - CB_KEYS_PREFIX: Screenshot control keys (kb:<key_id>:<window>)
+  - CB_PERM_*: Permission mode picker (CCBOT_PERMISSION_CHOICE)
 """
 
 # History pagination
@@ -49,3 +50,10 @@ CB_SESSION_CANCEL = "rs:cancel"  # cancel
 
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
+
+# Permission mode picker (CCBOT_PERMISSION_CHOICE): pm:<n|b|x>:<8-hex token>
+# The token is per picker; directory and session ID stay in topic data.
+CB_PERM_PREFIX = "pm:"
+CB_PERM_NORMAL = "pm:n:"
+CB_PERM_BYPASS = "pm:b:"
+CB_PERM_CANCEL = "pm:x:"

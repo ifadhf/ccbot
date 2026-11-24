@@ -14,7 +14,12 @@ import ccbot.recovery as recovery
 from ccbot.config import Config, config
 from ccbot.session import SessionManager
 
-FLAGS = ("ignore_general_topic", "session_recovery", "file_transfer")
+FLAGS = (
+    "ignore_general_topic",
+    "session_recovery",
+    "file_transfer",
+    "permission_choice",
+)
 SID = "11111111-2222-3333-4444-555555555555"
 
 
@@ -34,6 +39,42 @@ def test_flags_default_off(monkeypatch, tmp_path):
     assert not any(getattr(cfg, name) for name in FLAGS)
     monkeypatch.setenv("CCBOT_FILE_TRANSFER", "true")
     assert load().file_transfer is True
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("true", True), ("TRUE", True), ("false", False), ("1", False)],
+)
+def test_permission_choice_flag_parses(monkeypatch, tmp_path, value, expected):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test:token")
+    monkeypatch.setenv("ALLOWED_USERS", "12345")
+    monkeypatch.setenv("CCBOT_PERMISSION_CHOICE", value)
+    assert Config().permission_choice is expected
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "claude --dangerously-skip-permissions",
+        "claude --allow-dangerously-skip-permissions",
+        "claude --permission-mode plan",
+        "claude --permission-mode=acceptEdits",
+    ],
+)
+def test_permission_choice_warns_about_permission_flag_in_command(
+    monkeypatch, tmp_path, caplog, command
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test:token")
+    monkeypatch.setenv("ALLOWED_USERS", "12345")
+    monkeypatch.setenv("CCBOT_PERMISSION_CHOICE", "true")
+    monkeypatch.setenv("CLAUDE_COMMAND", command)
+    with caplog.at_level("WARNING", logger="ccbot.config"):
+        Config()
+    assert "won't remove a permission flag" in caplog.text
 
 
 @pytest.mark.parametrize("enabled", [False, True])

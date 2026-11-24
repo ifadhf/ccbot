@@ -19,6 +19,7 @@ import logging
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 
+from ..config import config
 from ..session import session_manager
 from ..terminal_parser import extract_interactive_content, is_interactive_ui
 from ..tmux_manager import tmux_manager
@@ -84,10 +85,11 @@ def _build_interactive_keyboard(
 ) -> InlineKeyboardMarkup:
     """Build keyboard for interactive UI navigation.
 
-    ``ui_name`` controls the layout: ``RestoreCheckpoint`` omits ←/→ keys
-    since only vertical selection is needed.
+    ``ui_name`` controls the layout: ``RestoreCheckpoint`` and
+    ``BypassPermissionsWarning`` omit ←/→ keys since only vertical selection
+    is needed.
     """
-    vertical_only = ui_name == "RestoreCheckpoint"
+    vertical_only = ui_name in ("RestoreCheckpoint", "BypassPermissionsWarning")
 
     rows: list[list[InlineKeyboardButton]] = []
     # Row 1: directional keys
@@ -178,6 +180,14 @@ async def handle_interactive_ui(
     content = extract_interactive_content(pane_text)
     if not content:
         return False
+
+    # The Bypass warning only appears for windows CCBot launched in Bypass;
+    # anywhere else a match is a false positive, so show no keyboard.
+    # Same gate as text_handler: flag on and window recorded as Bypass.
+    if content.name == "BypassPermissionsWarning":
+        state = session_manager.window_states.get(window_id)
+        if not (config.permission_choice and state and state.skip_permissions):
+            return False
 
     # Build message with navigation keyboard
     keyboard = _build_interactive_keyboard(window_id, ui_name=content.name)

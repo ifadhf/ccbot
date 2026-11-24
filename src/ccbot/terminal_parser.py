@@ -2,15 +2,16 @@
 
 Parses captured tmux pane content to detect:
   - Interactive UIs (AskUserQuestion, ExitPlanMode, Permission Prompt,
-    RestoreCheckpoint) via regex-based UIPattern matching with top/bottom
-    delimiters.
+    BypassPermissionsWarning, RestoreCheckpoint) via regex-based UIPattern
+    matching with top/bottom delimiters.
   - Status line (spinner characters + working text) by scanning from bottom up.
 
 All Claude Code text patterns live here. To support a new UI type or
 a changed Claude Code version, edit UI_PATTERNS / STATUS_SPINNERS.
 
-Key functions: is_interactive_ui(), extract_interactive_content(),
-parse_status_line(), strip_pane_chrome(), extract_bash_output().
+Key functions: is_interactive_ui(), is_bypass_warning(),
+extract_interactive_content(), parse_status_line(), strip_pane_chrome(),
+extract_bash_output().
 """
 
 import re
@@ -42,6 +43,9 @@ class UIPattern:
     top: tuple[re.Pattern[str], ...]
     bottom: tuple[re.Pattern[str], ...]
     min_gap: int = 2  # minimum lines between top and bottom (inclusive)
+    # When > 0, the bottom line must be among the last N non-empty lines, so
+    # an old copy scrolled up the pane (or quoted text) does not match.
+    bottom_within_last: int = 0
 
 
 # ── UI pattern definitions (order matters — first match wins) ────────────
@@ -80,6 +84,23 @@ UI_PATTERNS: list[UIPattern] = [
             re.compile(r"^\s*Do you want to delete \S"),
         ),
         bottom=(re.compile(r"^\s*Esc to cancel"),),
+    ),
+    UIPattern(
+        # One-time confirmation shown when Claude starts with
+        # --dangerously-skip-permissions ("1. No, exit / 2. Yes, I accept").
+        # Wording not captured from a live pane; must precede the generic
+        # numbered menu below.
+        # Anchored to dialog lines: optional box border or spaces only, so a
+        # "●"-prefixed reply that quotes the wording does not match.
+        name="BypassPermissionsWarning",
+        top=(
+            re.compile(
+                r"^[\s│┃║|]*(WARNING:\s*)?Claude Code running in Bypass Permissions mode"
+            ),
+        ),
+        bottom=(re.compile(r"^[\s│┃║|]*(❯\s*)?2\.\s*Yes, I accept"),),
+        min_gap=2,
+        bottom_within_last=8,
     ),
     UIPattern(
         # Permission menu with numbered choices (no "Esc to cancel" line)
@@ -163,6 +184,10 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
 
     if bottom_idx is None or bottom_idx - top_idx < pattern.min_gap:
         return None
+    if pattern.bottom_within_last:
+        later = sum(1 for line in lines[bottom_idx + 1 :] if line.strip())
+        if later >= pattern.bottom_within_last:
+            return None
 
     content = "\n".join(lines[top_idx : bottom_idx + 1]).rstrip()
     return InteractiveUIContent(content=_shorten_separators(content), name=pattern.name)
@@ -191,6 +216,12 @@ def extract_interactive_content(pane_text: str) -> InteractiveUIContent | None:
 def is_interactive_ui(pane_text: str) -> bool:
     """Check if terminal currently shows an interactive UI."""
     return extract_interactive_content(pane_text) is not None
+
+
+def is_bypass_warning(pane_text: str) -> bool:
+    """Check if the pane shows Claude's one-time Bypass Permissions warning."""
+    content = extract_interactive_content(pane_text)
+    return content is not None and content.name == "BypassPermissionsWarning"
 
 
 # ── Status line parsing ─────────────────────────────────────────────────

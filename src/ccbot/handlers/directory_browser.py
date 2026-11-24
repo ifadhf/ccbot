@@ -3,14 +3,18 @@
 Provides UIs in Telegram for:
   - Window picker: list unbound tmux windows for quick binding
   - Directory browser: navigate directory hierarchies to create new sessions
+  - Session picker: resume an existing Claude session or start a new one
+  - Permission picker (CCBOT_PERMISSION_CHOICE): Normal or Bypass launch
 
 Key components:
   - DIRS_PER_PAGE: Number of directories shown per page
   - User state keys for tracking browse/picker session
   - build_window_picker: Build unbound window picker UI
   - build_directory_browser: Build directory browser UI
+  - build_permission_picker: Build Normal/Bypass picker UI
   - clear_window_picker_state: Clear picker state from user_data
   - clear_browse_state: Clear browsing state from user_data
+  - clear_permission_picker_state: Clear permission picker state
 """
 
 import os
@@ -28,6 +32,9 @@ from .callback_data import (
     CB_DIR_PAGE,
     CB_DIR_SELECT,
     CB_DIR_UP,
+    CB_PERM_BYPASS,
+    CB_PERM_CANCEL,
+    CB_PERM_NORMAL,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
     CB_SESSION_SELECT,
@@ -49,6 +56,9 @@ BROWSE_DIRS_KEY = "browse_dirs"  # Cache of subdirs for current path
 UNBOUND_WINDOWS_KEY = "unbound_windows"  # Cache of (name, cwd) tuples
 STATE_SELECTING_SESSION = "selecting_session"
 SESSIONS_KEY = "cached_sessions"  # Cache of ClaudeSession list
+STATE_SELECTING_PERMISSION = "selecting_permission"
+# {"path", "resume_session_id", "thread_id", "user_id", "token"}
+PERM_PENDING_KEY = "_perm_pending"
 
 
 def clear_browse_state(user_data: dict | None) -> None:
@@ -72,6 +82,13 @@ def clear_session_picker_state(user_data: dict | None) -> None:
     if user_data is not None:
         user_data.pop(STATE_KEY, None)
         user_data.pop(SESSIONS_KEY, None)
+
+
+def clear_permission_picker_state(user_data: dict | None) -> None:
+    """Clear permission picker state keys from user_data."""
+    if user_data is not None:
+        user_data.pop(STATE_KEY, None)
+        user_data.pop(PERM_PENDING_KEY, None)
 
 
 def build_window_picker(
@@ -253,4 +270,46 @@ def build_session_picker(
     )
 
     text = "\n".join(lines)
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_permission_picker(
+    selected_path: str,
+    token: str,
+    resume_summary: str | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """Build the Normal/Bypass choice shown before a picked session starts.
+
+    Args:
+        selected_path: Directory the session will start in.
+        token: Per-picker token embedded in callback data to reject old buttons.
+        resume_summary: Summary of the session to resume, or None for a new one.
+
+    Returns: (text, keyboard).
+    """
+    display_path = selected_path.replace(str(Path.home()), "~")
+    if resume_summary is None:
+        target = "New session"
+    else:
+        summary = (
+            resume_summary[:40] + "…" if len(resume_summary) > 40 else resume_summary
+        )
+        target = f"Resume: {summary}"
+    text = "\n".join(
+        [
+            "*Permission mode*\n",
+            f"Directory: `{display_path}`",
+            f"{target}\n",
+            "🛡 Normal: uses your Claude settings and asks before risky actions.",
+            "⚠️ Bypass: starts with `--dangerously-skip-permissions`; every tool, "
+            "including shell commands, runs without asking.",
+        ]
+    )
+    buttons = [
+        [
+            InlineKeyboardButton("🛡 Normal", callback_data=f"{CB_PERM_NORMAL}{token}"),
+            InlineKeyboardButton("⚠️ Bypass", callback_data=f"{CB_PERM_BYPASS}{token}"),
+        ],
+        [InlineKeyboardButton("Cancel", callback_data=f"{CB_PERM_CANCEL}{token}")],
+    ]
     return text, InlineKeyboardMarkup(buttons)

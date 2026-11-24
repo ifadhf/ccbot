@@ -100,8 +100,9 @@ async def update_status_message(
             window_id,
             thread_id,
         )
-        await handle_interactive_ui(bot, user_id, window_id, thread_id)
-        return
+        if await handle_interactive_ui(bot, user_id, window_id, thread_id):
+            return
+        # Nothing was shown (e.g. a filtered match): fall through to status.
 
     # Normal status line check — skip if queue is non-empty
     if skip_status:

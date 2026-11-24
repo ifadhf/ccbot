@@ -5,6 +5,8 @@ Wraps libtmux to provide async-friendly operations on a single tmux session:
   - capture_pane: read terminal content (plain or with ANSI colors).
   - send_keys: forward user input or control keys to a window.
   - create_window / kill_window: lifecycle management.
+  - build_claude_command: the launch line, optionally with
+    --dangerously-skip-permissions (Bypass mode) before --resume.
 
 All blocking libtmux calls are wrapped in asyncio.to_thread().
 
@@ -30,6 +32,24 @@ logger = logging.getLogger(__name__)
 _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
+
+# Added for windows launched in Bypass mode (CCBOT_PERMISSION_CHOICE).
+BYPASS_PERMISSIONS_FLAG = "--dangerously-skip-permissions"
+
+
+def build_claude_command(
+    resume_session_id: str | None = None, skip_permissions: bool = False
+) -> str:
+    """Build the Claude launch line; callers validate resume_session_id first."""
+    parts = [config.claude_command]
+    if (
+        skip_permissions
+        and BYPASS_PERMISSIONS_FLAG not in config.claude_command.split()
+    ):
+        parts.append(BYPASS_PERMISSIONS_FLAG)
+    if resume_session_id:
+        parts += ["--resume", resume_session_id]
+    return " ".join(parts)
 
 
 @dataclass
@@ -402,6 +422,7 @@ class TmuxManager:
         start_claude: bool = True,
         resume_session_id: str | None = None,
         recovery_token: str | None = None,
+        skip_permissions: bool = False,
     ) -> tuple[bool, str, str, str]:
         """Create a new tmux window and optionally start Claude Code.
 
@@ -411,6 +432,7 @@ class TmuxManager:
             start_claude: Whether to start claude command
             resume_session_id: If set, append --resume <id> to claude command
             recovery_token: Journal token attached before launching a restore.
+            skip_permissions: Launch Claude with --dangerously-skip-permissions.
 
         Returns:
             Tuple of (success, message, window_name, window_id)
@@ -434,6 +456,8 @@ class TmuxManager:
             or not start_claude
         ):
             return False, "Invalid recovery launch", "", ""
+        if skip_permissions and not start_claude:
+            return False, "Invalid launch options", "", ""
 
         # Create window name, adding suffix if name already exists
         final_window_name = window_name if window_name else path.name
@@ -461,7 +485,7 @@ class TmuxManager:
                     # tmux operation, so a bot crash cannot strand a shell that
                     # a retry would mistake for an already launched Claude.
                     window_shell=(
-                        f"{config.claude_command} --resume {resume_session_id}"
+                        build_claude_command(resume_session_id, skip_permissions)
                         if recovery_token
                         else None
                     ),
@@ -479,16 +503,17 @@ class TmuxManager:
                 if start_claude and not recovery_token:
                     pane = window.active_pane
                     if pane:
-                        cmd = config.claude_command
-                        if resume_session_id:
-                            cmd = f"{cmd} --resume {resume_session_id}"
-                        pane.send_keys(cmd, enter=True)
+                        pane.send_keys(
+                            build_claude_command(resume_session_id, skip_permissions),
+                            enter=True,
+                        )
 
                 logger.info(
-                    "Created window '%s' (id=%s) at %s",
+                    "Created window '%s' (id=%s) at %s mode=%s",
                     final_window_name,
                     wid,
                     path,
+                    "bypass" if skip_permissions else "normal",
                 )
                 return (
                     True,

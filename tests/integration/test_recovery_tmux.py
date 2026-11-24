@@ -23,7 +23,8 @@ from ccbot.tmux_manager import TmuxManager
 @pytest.mark.integration
 @pytest.mark.asyncio
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is unavailable")
-async def test_recovery_survives_real_tmux_server_loss(monkeypatch, tmp_path):
+@pytest.mark.parametrize("bypass", [False, True])
+async def test_recovery_survives_real_tmux_server_loss(monkeypatch, tmp_path, bypass):
     sid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     source = Path(__file__).resolve().parents[2] / "src"
     monkeypatch.setenv("CCBOT_DIR", str(tmp_path))
@@ -36,6 +37,7 @@ async def test_recovery_survives_real_tmux_server_loss(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "ignore_general_topic", True)
     monkeypatch.setattr(config, "session_recovery", True)
     monkeypatch.setattr(config, "file_transfer", True)
+    monkeypatch.setattr(config, "permission_choice", True)
     monkeypatch.setattr(config, "allowed_users", {111})
     monkeypatch.setattr(recovery, "HOOK_TIMEOUT", 10)
     workspace = tmp_path / "work"
@@ -46,11 +48,11 @@ async def test_recovery_survives_real_tmux_server_loss(monkeypatch, tmp_path):
         f"sys.path.insert(0, {str(source)!r})\n"
         "from ccbot.hook import hook_main\n"
         "args = sys.argv[1:]\n"
-        "assert len(args) == 2 and args[0] == '--resume'\n"
+        "assert args[-2] == '--resume'\n"
         f"with open({str(tmp_path / 'launches.jsonl')!r}, 'a') as output:\n"
         "    output.write(json.dumps(args) + '\\n')\n"
         "sys.stdin = io.StringIO(json.dumps({'hook_event_name': 'SessionStart', "
-        "'source': 'resume', 'session_id': args[1], 'cwd': os.getcwd()}))\n"
+        "'source': 'resume', 'session_id': args[-1], 'cwd': os.getcwd()}))\n"
         "sys.argv = ['ccbot', 'hook']\n"
         "hook_main()\n"
         "time.sleep(120)\n"
@@ -65,13 +67,19 @@ async def test_recovery_survives_real_tmux_server_loss(monkeypatch, tmp_path):
     monkeypatch.setattr(recovery, "tmux_manager", tmux)
     manager = SessionManager()
     manager.tmux_session_identity = "old-instance"
-    manager.window_states["@8"] = WindowState(sid, str(workspace), "Saved topic")
+    manager.window_states["@8"] = WindowState(
+        sid, str(workspace), "Saved topic", skip_permissions=bypass
+    )
     manager.bind_thread(-10011, 42, "@8", "Saved topic")
     manager.claim_topic(-10011, 42, 111, "owner", "Owner")
     transcript = manager._build_session_file_path(sid, str(workspace))
     assert transcript is not None
     transcript.parent.mkdir(parents=True)
     transcript.write_text(json.dumps({"sessionId": sid, "cwd": str(workspace)}) + "\n")
+    expected = (["--dangerously-skip-permissions"] if bypass else []) + [
+        "--resume",
+        sid,
+    ]
     try:
         await recovery.recover_sessions(manager)
         assert not manager.pending_recoveries, manager.pending_recoveries
@@ -95,6 +103,7 @@ async def test_recovery_survives_real_tmux_server_loss(monkeypatch, tmp_path):
         assert [
             json.loads(line)
             for line in (tmp_path / "launches.jsonl").read_text().splitlines()
-        ] == [["--resume", sid], ["--resume", sid]]
+        ] == [expected, expected]
+        assert reloaded.window_states[wid].skip_permissions is bypass
     finally:
         server.kill()

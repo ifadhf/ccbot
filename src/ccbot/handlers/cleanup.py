@@ -11,6 +11,11 @@ from typing import Any
 
 from telegram import Bot
 
+from .directory_browser import (
+    PERM_PENDING_KEY,
+    STATE_KEY,
+    STATE_SELECTING_PERMISSION,
+)
 from .interactive_ui import clear_interactive_msg
 from .message_queue import clear_status_msg_info, clear_tool_msg_ids_for_topic
 
@@ -32,6 +37,7 @@ async def clear_topic_state(
       - _tool_msg_ids (tool_use → message_id mapping)
       - _interactive_msgs and _interactive_mode (interactive UI state)
       - user_data pending state (_pending_thread_id, _pending_thread_text)
+      - permission mode picker state started in this topic
     """
     # Clear status message tracking
     clear_status_msg_info(user_id, thread_id)
@@ -44,6 +50,12 @@ async def clear_topic_state(
 
     # Clear pending thread state from user_data
     if user_data is not None:
+        pending = user_data.get(PERM_PENDING_KEY)
+        if isinstance(pending, dict) and pending.get("thread_id") == thread_id:
+            user_data.pop(PERM_PENDING_KEY, None)
+            if user_data.get(STATE_KEY) == STATE_SELECTING_PERMISSION:
+                user_data.pop(STATE_KEY, None)
         if user_data.get("_pending_thread_id") == thread_id:
             user_data.pop("_pending_thread_id", None)
             user_data.pop("_pending_thread_text", None)
+            user_data.pop("_pending_user_id", None)

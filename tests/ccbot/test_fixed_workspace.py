@@ -214,7 +214,9 @@ async def test_hook_timeout_keeps_binding_for_retry(fixed_app):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("data", ["db:confirm", "wb:sel:0", "rs:sel:0"])
+@pytest.mark.parametrize(
+    "data", ["db:confirm", "wb:sel:0", "rs:sel:0", "pm:b:deadbeef"]
+)
 async def test_old_picker_buttons_cannot_override_fixed_folder(fixed_app, data):
     app, _, windows, _ = fixed_app
     await app.process_update(Update.de_json(payload(), app.bot))
@@ -321,3 +323,14 @@ async def test_missing_window_on_first_message_preserves_previous_session(fixed_
     )
     assert bot_module.tmux_manager.create_window.await_count == 1
     manager.send_to_window.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fixed_workspace_resets_stale_bypass_on_recycled_window(fixed_app):
+    from ccbot.session import WindowState
+
+    app, manager, _, _ = fixed_app
+    manager.window_states["@1"] = WindowState(skip_permissions=True)
+    await app.process_update(Update.de_json(payload(), app.bot))
+    assert manager.get_window_for_thread(-10011, 42) == "@1"
+    assert manager.window_states["@1"].skip_permissions is False

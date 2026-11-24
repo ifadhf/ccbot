@@ -5,6 +5,7 @@ import pytest
 from ccbot.terminal_parser import (
     extract_bash_output,
     extract_interactive_content,
+    is_bypass_warning,
     is_interactive_ui,
     parse_status_line,
     strip_pane_chrome,
@@ -263,3 +264,73 @@ class TestExtractBashOutput:
         result = extract_bash_output(pane, "echo hi")
         assert result is not None
         assert not result.endswith("\n")
+
+
+BYPASS_WARNING = (
+    " WARNING: Claude Code running in Bypass Permissions mode\n"
+    "\n"
+    " In Bypass Permissions mode, Claude Code will not ask for your approval\n"
+    " before running potentially dangerous commands.\n"
+    "\n"
+    " ❯ 1. No, exit\n"
+    "   2. Yes, I accept\n"
+    "\n"
+    " Enter to confirm · Esc to exit\n"
+)
+
+
+class TestBypassPermissionsWarning:
+    # Wording modeled on Claude Code's one-time Bypass warning; not captured live.
+    def test_warning_detected(self):
+        result = extract_interactive_content(BYPASS_WARNING)
+        assert result is not None
+        assert result.name == "BypassPermissionsWarning"
+        assert is_bypass_warning(BYPASS_WARNING)
+
+    def test_not_confused_with_permission_prompt(self, sample_pane_permission: str):
+        assert not is_bypass_warning(sample_pane_permission)
+        numbered = "  Allow this?\n ❯ 1. Yes\n   2. Yes, always\n   3. No\n"
+        assert not is_bypass_warning(numbered)
+        result = extract_interactive_content(numbered)
+        assert result is not None and result.name == "PermissionPrompt"
+
+    def test_footer_indicator_is_not_the_warning(self, chrome: str):
+        pane = "done\n" + chrome + "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+        assert not is_bypass_warning(pane)
+
+    def test_empty(self):
+        assert not is_bypass_warning("")
+
+
+class TestBypassWarningFalsePositives:
+    def test_bullet_reply_quoting_both_phrases(self, chrome: str):
+        pane = (
+            "● Claude Code running in Bypass Permissions mode asks you to pick\n"
+            "  2. Yes, I accept before it continues.\n" + chrome
+        )
+        assert not is_bypass_warning(pane)
+
+    def test_phrases_mid_pane_followed_by_more_output(self, chrome: str):
+        pane = (
+            BYPASS_WARNING + "".join(f"output line {i}\n" for i in range(10)) + chrome
+        )
+        assert not is_bypass_warning(pane)
+
+    def test_inline_mentions_are_not_dialog_lines(self):
+        pane = (
+            "  The Bypass Permissions mode dialog\n"
+            "  has an option Yes, I accept\n"
+            "  and another line\n"
+        )
+        assert not is_bypass_warning(pane)
+
+    def test_boxed_dialog_still_detected(self):
+        pane = (
+            "╭──────────────────────────────╮\n"
+            "│ WARNING: Claude Code running in Bypass Permissions mode │\n"
+            "│                              │\n"
+            "│ ❯ 1. No, exit                │\n"
+            "│   2. Yes, I accept           │\n"
+            "╰──────────────────────────────╯\n"
+        )
+        assert is_bypass_warning(pane)

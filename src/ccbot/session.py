@@ -50,11 +50,14 @@ class WindowState:
         session_id: Associated Claude session ID (empty if not yet detected)
         cwd: Working directory for direct file path construction
         window_name: Display name of the window
+        skip_permissions: Launched in Bypass mode (--dangerously-skip-permissions);
+            recorded at launch so /recover relaunches in the same mode.
     """
 
     session_id: str = ""
     cwd: str = ""
     window_name: str = ""
+    skip_permissions: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -63,6 +66,8 @@ class WindowState:
         }
         if self.window_name:
             d["window_name"] = self.window_name
+        if self.skip_permissions:
+            d["skip_permissions"] = True
         return d
 
     @classmethod
@@ -72,10 +77,14 @@ class WindowState:
             for key in ("session_id", "cwd", "window_name")
         ):
             raise ValueError("Invalid saved window state")
+        skip = data.get("skip_permissions", False)
+        if not isinstance(skip, bool):
+            raise ValueError("Invalid saved window state")
         return cls(
             session_id=data.get("session_id", ""),
             cwd=data.get("cwd", ""),
             window_name=data.get("window_name", ""),
+            skip_permissions=skip,
         )
 
 

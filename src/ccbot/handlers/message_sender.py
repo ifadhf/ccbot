@@ -247,8 +247,11 @@ async def safe_send(
     text: str,
     message_thread_id: int | None = None,
     **kwargs: Any,
-) -> None:
-    """Send message with formatting, falling back to plain text on failure."""
+) -> Message | None:
+    """Send message with formatting, falling back to plain text on failure.
+
+    Returns the sent Message, or None when every attempt failed.
+    """
     if message_thread_id is not None:
         kwargs.setdefault("message_thread_id", message_thread_id)
-    await send_with_fallback(bot, chat_id, text, **kwargs)
+    return await send_with_fallback(bot, chat_id, text, **kwargs)

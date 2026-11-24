@@ -120,6 +120,7 @@ async def test_picker_state_does_not_leak_between_private_and_shared_group(
         get_topic_data(second_user_context, 42)["_pending_thread_text"] == "shared task"
     )
 
+    # Any allowed member may cancel a shared setup; it never leaks to private.
     update = make_update(222, -10022)
     message = update.message
     update.message = None

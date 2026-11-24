@@ -77,6 +77,11 @@ class Config:
         )
         # Telegram document downloads and the `ccbot files`/`send-file` helpers.
         self.file_transfer = os.getenv("CCBOT_FILE_TRANSFER", "false").lower() == "true"
+        # Ask Normal vs Bypass (--dangerously-skip-permissions) before a picked
+        # session starts. When off, Bypass is never added, including recovery.
+        self.permission_choice = (
+            os.getenv("CCBOT_PERMISSION_CHOICE", "false").lower() == "true"
+        )
 
         # Tmux session name and window naming
         self.tmux_session_name = os.getenv("TMUX_SESSION_NAME", "ccbot")
@@ -95,6 +100,30 @@ class Config:
                     "CCBOT_FIXED_WORKDIR must be an existing absolute directory"
                 )
             self.fixed_workdir = path.resolve()
+
+        if self.permission_choice:
+            command_args = self.claude_command.split()
+            if any(
+                arg
+                in (
+                    "--dangerously-skip-permissions",
+                    "--allow-dangerously-skip-permissions",
+                    "--permission-mode",
+                )
+                or arg.startswith("--permission-mode=")
+                for arg in command_args
+            ):
+                logger.warning(
+                    "CCBOT_PERMISSION_CHOICE is on but CLAUDE_COMMAND sets a "
+                    "permission flag; Normal won't remove a permission flag "
+                    "from CLAUDE_COMMAND"
+                )
+            if self.fixed_workdir:
+                logger.warning(
+                    "CCBOT_PERMISSION_CHOICE has no effect with CCBOT_FIXED_WORKDIR: "
+                    "the fixed workspace never shows the picker and always "
+                    "starts Normal"
+                )
 
         # All state files live under config_dir
         self.state_file = self.config_dir / "state.json"

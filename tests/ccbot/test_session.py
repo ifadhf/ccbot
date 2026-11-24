@@ -5,7 +5,7 @@ import json
 import pytest
 
 import ccbot.session as session_mod
-from ccbot.session import SessionManager
+from ccbot.session import SessionManager, WindowState
 from ccbot.tmux_manager import TmuxWindow
 
 
@@ -342,3 +342,60 @@ class TestLoadSessionMapMigration:
 
         await mgr.load_session_map()
         assert mgr.get_window_state("@4").session_id == "sid-1"
+
+
+class TestWindowStatePermissionMode:
+    """skip_permissions records the launch mode chosen with CCBOT_PERMISSION_CHOICE."""
+
+    @pytest.fixture
+    def real(self, monkeypatch, tmp_path) -> SessionManager:
+        monkeypatch.setattr(session_mod.config, "state_file", tmp_path / "state.json")
+        monkeypatch.setattr(session_mod.config, "chat_scoped_topics", False)
+        return SessionManager()
+
+    def test_roundtrip(self) -> None:
+        state = WindowState("sid", "/proj", "proj", skip_permissions=True)
+        data = state.to_dict()
+        assert data["skip_permissions"] is True
+        assert WindowState.from_dict(data) == state
+
+    def test_normal_omits_key(self) -> None:
+        assert "skip_permissions" not in WindowState("sid", "/proj").to_dict()
+
+    def test_old_state_loads_normal(self) -> None:
+        assert WindowState.from_dict({"session_id": "s", "cwd": "/p"}) == WindowState(
+            "s", "/p"
+        )
+
+    @pytest.mark.parametrize("value", ["true", 1, None])
+    def test_invalid_type_refuses_load(self, real, value) -> None:
+        session_mod.config.state_file.write_text(
+            json.dumps(
+                {
+                    "window_states": {
+                        "@1": {
+                            "session_id": "s",
+                            "cwd": "/p",
+                            "skip_permissions": value,
+                        }
+                    }
+                }
+            )
+        )
+        with pytest.raises(RuntimeError, match="refusing to overwrite"):
+            SessionManager()
+
+    def test_survives_save_and_reload(self, real) -> None:
+        real.get_window_state("@1").skip_permissions = True
+        real.bind_thread(100, 42, "@1", "proj")
+        reloaded = SessionManager()
+        assert reloaded.window_states["@1"].skip_permissions is True
+
+    def test_stage_recovery_snapshot_keeps_mode(self, real) -> None:
+        state = real.get_window_state("@1")
+        state.session_id, state.cwd, state.skip_permissions = "sid", "/proj", True
+        real.bind_thread(100, 42, "@1", "proj")
+        real.stage_recovery(100, 42)
+        snapshot = SessionManager().pending_recoveries["100:42"]["window_state"]
+        assert snapshot["skip_permissions"] is True
+        assert WindowState.from_dict(snapshot).skip_permissions is True

@@ -45,7 +45,7 @@ async def _prepare_state(
     )
     hook_map = _read_map()
     for route_id, topic_id, wid in list(manager.iter_thread_bindings()):
-        state = manager.window_states.get(wid, WindowState())
+        state = previous = manager.window_states.get(wid, WindowState())
         info = hook_map.get(f"{config.tmux_session_name}:{wid}", {})
         if isinstance(info, dict) and (
             info.get("tmux_session_identity", "") == manager.tmux_session_identity
@@ -53,7 +53,9 @@ async def _prepare_state(
         ):
             # Preserve the latest hook, including /clear just before power
             # loss, even if the monitor had not copied it to state.json yet.
+            # Hook entries never carry the launch mode; keep the recorded one.
             state = WindowState.from_dict(info)
+            state.skip_permissions = previous.skip_permissions
             manager.window_states[wid] = state
         window = windows.get(wid)
         legacy_match = bool(
@@ -141,6 +143,9 @@ async def _recover_topic(manager: SessionManager, key: str, identity: str) -> bo
         elif not config.chat_scoped_topics and route_id not in config.allowed_users:
             raise ValueError("The saved user is not allowed")
         state = WindowState.from_dict(record["window_state"])
+        # The flag doubles as a kill switch: when off, never relaunch in Bypass,
+        # but keep the recorded mode so turning it back on restores it.
+        bypass = state.skip_permissions and config.permission_choice
         if not SESSION_ID.fullmatch(state.session_id):
             raise ValueError("The saved Claude session ID is missing or invalid")
         if not Path(state.cwd).is_absolute() or not Path(state.cwd).is_dir():
@@ -189,6 +194,7 @@ async def _recover_topic(manager: SessionManager, key: str, identity: str) -> bo
                 window_name=state.window_name or None,
                 resume_session_id=state.session_id,
                 recovery_token=token,
+                skip_permissions=bypass,
             )
             if not success:
                 raise ValueError("Could not launch the saved Claude conversation")
@@ -215,6 +221,12 @@ async def _recover_topic(manager: SessionManager, key: str, identity: str) -> bo
             if asyncio.get_running_loop().time() >= deadline:
                 raise ValueError(
                     "No matching SessionStart hook; check Claude login and hooks"
+                    + (
+                        " (Bypass mode: accept Claude's one-time Bypass Permissions "
+                        "warning in tmux, or set skipDangerousModePermissionPrompt)"
+                        if bypass
+                        else ""
+                    )
                 )
             await asyncio.sleep(0.25)
 
@@ -223,6 +235,9 @@ async def _recover_topic(manager: SessionManager, key: str, identity: str) -> bo
         # One atomic state.json update replaces the journal record with the
         # ready binding and restores the original unread offset and ownership.
         state.window_name = window.window_name
+        # Record the mode actually launched: with the flag off a Bypass record
+        # is relaunched (and from now on kept) as Normal.
+        state.skip_permissions = bypass
         manager.window_states[wid] = state
         manager.window_display_names[wid] = state.window_name
         manager.thread_bindings.setdefault(route_id, {})[topic_id] = wid

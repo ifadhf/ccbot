@@ -34,6 +34,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "ignore_general_topic", True)
     monkeypatch.setattr(config, "session_recovery", True)
     monkeypatch.setattr(config, "file_transfer", True)
+    monkeypatch.setattr(config, "permission_choice", True)
     monkeypatch.setattr(config, "allowed_users", {111, 222})
     monkeypatch.setattr(config, "tmux_session_name", "ccbot")
     monkeypatch.setattr(recovery, "HOOK_TIMEOUT", 0)
@@ -43,10 +44,13 @@ def env(monkeypatch, tmp_path):
     manager.tmux_session_identity = OLD_INSTANCE
     windows = {}
     launches = []
+    skips = []
     modes = {}
 
-    def add_topic(route=-10011, topic=42, wid="@8", sid=SID, name="Original"):
-        state = WindowState(sid, str(cwd), name)
+    def add_topic(
+        route=-10011, topic=42, wid="@8", sid=SID, name="Original", skip=False
+    ):
+        state = WindowState(sid, str(cwd), name, skip_permissions=skip)
         manager.window_states[wid] = state
         manager.bind_thread(route, topic, wid, name)
         manager.user_window_offsets.setdefault(route, {})[wid] = 1234
@@ -71,7 +75,11 @@ def env(monkeypatch, tmp_path):
         atomic_write_json(config.session_map_file, data)
 
     async def create(
-        directory, window_name=None, resume_session_id=None, recovery_token=None
+        directory,
+        window_name=None,
+        resume_session_id=None,
+        recovery_token=None,
+        skip_permissions=False,
     ):
         # Verify that an actual durable checkpoint precedes process creation.
         saved = json.loads(config.state_file.read_text())
@@ -84,6 +92,7 @@ def env(monkeypatch, tmp_path):
             return False, "failure", "", ""
         wid = f"@{len(launches) + 1}"
         launches.append((directory, resume_session_id, recovery_token, wid))
+        skips.append(skip_permissions)
         windows[wid] = TmuxWindow(
             wid, window_name or "Restored", directory, "claude", recovery_token
         )
@@ -115,6 +124,7 @@ def env(monkeypatch, tmp_path):
         manager=manager,
         windows=windows,
         launches=launches,
+        skips=skips,
         modes=modes,
         add_topic=add_topic,
         write_hook=write_hook,
@@ -505,3 +515,68 @@ async def test_cancel_kills_only_this_topics_recovery_candidate(env):
     assert await recovery.cancel_recovery(env.manager, -10011, 42, kill=True)
     env.tmux.kill_window.assert_awaited_once_with("@1")
     assert not SessionManager().pending_recoveries
+
+
+@pytest.mark.asyncio
+async def test_recovery_relaunches_with_persisted_bypass(env):
+    env.add_topic(skip=True)
+    await recovery.recover_sessions(env.manager)
+    assert env.skips == [True]
+    assert env.manager.window_states["@1"].skip_permissions is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_record_without_mode_recovers_normal(env):
+    env.add_topic()
+    saved = json.loads(config.state_file.read_text())
+    assert "skip_permissions" not in saved["window_states"]["@8"]
+    await recovery.recover_sessions(SessionManager())
+    assert env.skips == [False]
+
+
+@pytest.mark.asyncio
+async def test_latest_hook_before_power_loss_keeps_mode(env):
+    env.add_topic(skip=True)
+    atomic_write_json(
+        config.session_map_file,
+        {
+            "ccbot:@8": {
+                "session_id": SID,
+                "cwd": str(env.cwd),
+                "window_name": "Original",
+                "tmux_session_identity": OLD_INSTANCE,
+            }
+        },
+    )
+    await recovery.recover_sessions(env.manager)
+    assert env.skips == [True]
+
+
+@pytest.mark.asyncio
+async def test_recovery_ignores_persisted_bypass_when_flag_off(env, monkeypatch):
+    monkeypatch.setattr(config, "permission_choice", False)
+    env.add_topic(skip=True)
+    await recovery.recover_sessions(env.manager)
+    assert env.skips == [False]
+    # The committed binding records the mode actually launched (Normal).
+    assert env.manager.window_states["@1"].skip_permissions is False
+    assert SessionManager().window_states["@1"].skip_permissions is False
+
+
+@pytest.mark.asyncio
+async def test_recovered_binding_keeps_mode_after_reload(env):
+    env.add_topic(skip=True)
+    await recovery.recover_sessions(env.manager)
+    await env.manager.load_session_map()
+    reloaded = SessionManager()
+    assert reloaded.window_states["@1"].skip_permissions is True
+
+
+@pytest.mark.asyncio
+async def test_bypass_timeout_error_mentions_warning(env):
+    env.add_topic(skip=True)
+    env.modes[SID] = "timeout"
+    await recovery.recover_sessions(env.manager)
+    error = env.manager.pending_recoveries["-10011:42"]["error"]
+    assert "No matching SessionStart hook" in error
+    assert "Bypass" in error

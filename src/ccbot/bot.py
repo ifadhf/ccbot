@@ -36,6 +36,7 @@ import asyncio
 import io
 import logging
 import re
+import secrets
 import time
 from pathlib import Path
 
@@ -82,6 +83,7 @@ from .handlers.callback_data import (
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
     CB_KEYS_PREFIX,
+    CB_PERM_PREFIX,
     CB_SCREENSHOT_REFRESH,
     CB_SESSION_CANCEL,
     CB_SESSION_NEW,
@@ -95,16 +97,20 @@ from .handlers.directory_browser import (
     BROWSE_DIRS_KEY,
     BROWSE_PAGE_KEY,
     BROWSE_PATH_KEY,
+    PERM_PENDING_KEY,
     SESSIONS_KEY,
     STATE_BROWSING_DIRECTORY,
     STATE_KEY,
+    STATE_SELECTING_PERMISSION,
     STATE_SELECTING_SESSION,
     STATE_SELECTING_WINDOW,
     UNBOUND_WINDOWS_KEY,
     build_directory_browser,
+    build_permission_picker,
     build_session_picker,
     build_window_picker,
     clear_browse_state,
+    clear_permission_picker_state,
     clear_session_picker_state,
     clear_window_picker_state,
 )
@@ -141,7 +147,7 @@ from .recovery import cancel_recovery, prepare_recovery, recover_sessions, recov
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
-from .terminal_parser import extract_bash_output, is_interactive_ui
+from .terminal_parser import extract_bash_output, is_bypass_warning, is_interactive_ui
 from .tmux_manager import tmux_manager
 from .transcribe import close_client as close_transcribe_client
 from .transcribe import transcribe_voice
@@ -157,6 +163,18 @@ _status_poll_task: asyncio.Task | None = None
 
 # Serialize automatic creation so repeated updates cannot create two sessions.
 _fixed_workspace_lock = asyncio.Lock()
+
+# Replies for setup pickers (directory, session, permission mode).
+CHOICE_EXPIRED = "This choice has expired. Send a message to start again."
+SETUP_OWNER_ONLY = "Only the person who started this setup can choose."
+BYPASS_WARNING_NOTICE = (
+    "⚠️ Claude is asking you to accept Bypass Permissions mode (one-time). "
+    "Use the controls that appear below, then resend your message."
+)
+BYPASS_STARTING_NOTICE = (
+    "⚠️ Claude is still starting in Bypass mode, so your first message was not "
+    "sent. Resend it once Claude is ready."
+)
 
 # Claude Code commands shown in bot menu (forwarded via tmux)
 CC_COMMANDS: dict[str, str] = {
@@ -336,6 +354,15 @@ async def recover_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if wid and not await tmux_manager.find_window_by_id(wid):
         session_manager.stage_recovery(route_id, topic_id)
     if await recover_topic(session_manager, route_id, topic_id):
+        bound = session_manager.get_window_for_thread(route_id, topic_id)
+        state = session_manager.window_states.get(bound) if bound else None
+        if config.permission_choice and state and state.skip_permissions:
+            await safe_reply(
+                message,
+                "The saved conversation is connected in ⚠️ Bypass mode "
+                "(permission checks are skipped). Send your next message when ready.",
+            )
+            return
         await safe_reply(
             message,
             "The saved conversation is connected. Send your next message when ready.",
@@ -396,6 +423,8 @@ async def _ensure_fixed_topic_window(
                 )
                 return None
             topic = message.forum_topic_created
+            # Always Normal: the fixed workspace never shows the permission
+            # picker, even with CCBOT_PERMISSION_CHOICE on.
             success, _, name, wid = await tmux_manager.create_window(
                 str(config.fixed_workdir), window_name=topic.name if topic else None
             )
@@ -405,6 +434,9 @@ async def _ensure_fixed_topic_window(
                 )
                 return None
             session_manager.set_group_chat_id(route_id, thread_id, chat.id)
+            # Launched Normal; a recycled window ID must not keep a stale mode.
+            if wid in session_manager.window_states:
+                session_manager.window_states[wid].skip_permissions = False
             # Persist before waiting: a delayed hook must not cause a duplicate.
             session_manager.bind_thread(route_id, thread_id, wid, window_name=name)
         if not await session_manager.wait_for_session_map_entry(wid, timeout=30.0):
@@ -1260,11 +1292,48 @@ async def text_handler(
         clear_browse_state(topic_data)
         clear_window_picker_state(topic_data)
         clear_session_picker_state(topic_data)
+        clear_permission_picker_state(topic_data)
         if topic_data is not None:
-            for key in ("_pending_thread_id", "_pending_thread_text", "_selected_path"):
+            for key in (
+                "_pending_thread_id",
+                "_pending_thread_text",
+                "_pending_user_id",
+                "_selected_path",
+            ):
                 topic_data.pop(key, None)
         if not await _ensure_fixed_topic_window(update, context):
             return
+
+    # In a shared topic, a message from someone other than the person who
+    # opened the setup pickers replaces that setup instead of being refused.
+    if (
+        config.chat_scoped_topics
+        and topic_data
+        and topic_data.get(STATE_KEY)
+        in (
+            STATE_SELECTING_WINDOW,
+            STATE_BROWSING_DIRECTORY,
+            STATE_SELECTING_SESSION,
+            STATE_SELECTING_PERMISSION,
+        )
+        and topic_data.get("_pending_user_id") not in (None, user.id)
+    ):
+        logger.info(
+            "Clearing setup started by another user (user=%d, thread=%s)",
+            user.id,
+            thread_id,
+        )
+        clear_browse_state(topic_data)
+        clear_window_picker_state(topic_data)
+        clear_session_picker_state(topic_data)
+        clear_permission_picker_state(topic_data)
+        for key in (
+            "_pending_thread_id",
+            "_pending_thread_text",
+            "_pending_user_id",
+            "_selected_path",
+        ):
+            topic_data.pop(key, None)
 
     # Ignore text in window picker mode (only for the same thread)
     if topic_data and topic_data.get(STATE_KEY) == STATE_SELECTING_WINDOW:
@@ -1279,6 +1348,7 @@ async def text_handler(
         clear_window_picker_state(topic_data)
         topic_data.pop("_pending_thread_id", None)
         topic_data.pop("_pending_thread_text", None)
+        topic_data.pop("_pending_user_id", None)
 
     # Ignore text in directory browsing mode (only for the same thread)
     if topic_data and topic_data.get(STATE_KEY) == STATE_BROWSING_DIRECTORY:
@@ -1293,6 +1363,7 @@ async def text_handler(
         clear_browse_state(topic_data)
         topic_data.pop("_pending_thread_id", None)
         topic_data.pop("_pending_thread_text", None)
+        topic_data.pop("_pending_user_id", None)
 
     # Ignore text in session picker mode (only for the same thread)
     if topic_data and topic_data.get(STATE_KEY) == STATE_SELECTING_SESSION:
@@ -1307,7 +1378,27 @@ async def text_handler(
         clear_session_picker_state(topic_data)
         topic_data.pop("_pending_thread_id", None)
         topic_data.pop("_pending_thread_text", None)
+        topic_data.pop("_pending_user_id", None)
         topic_data.pop("_selected_path", None)
+
+    # Ignore text in permission picker mode (only for the same thread)
+    if topic_data and topic_data.get(STATE_KEY) == STATE_SELECTING_PERMISSION:
+        pending = topic_data.get(PERM_PENDING_KEY)
+        if (
+            config.permission_choice
+            and isinstance(pending, dict)
+            and pending.get("thread_id") == thread_id
+        ):
+            await safe_reply(
+                update.message,
+                "Please choose a permission mode above, or tap Cancel.",
+            )
+            return
+        # Stale picker state from a different thread — clear it
+        clear_permission_picker_state(topic_data)
+        topic_data.pop("_pending_thread_id", None)
+        topic_data.pop("_pending_thread_text", None)
+        topic_data.pop("_pending_user_id", None)
 
     # Must be in a named topic
     if thread_id is None:
@@ -1349,6 +1440,7 @@ async def text_handler(
                 topic_data[UNBOUND_WINDOWS_KEY] = win_ids
                 topic_data["_pending_thread_id"] = thread_id
                 topic_data["_pending_thread_text"] = text
+                topic_data["_pending_user_id"] = user.id
             await safe_reply(update.message, msg_text, reply_markup=keyboard)
             return
 
@@ -1367,6 +1459,7 @@ async def text_handler(
             topic_data[BROWSE_DIRS_KEY] = subdirs
             topic_data["_pending_thread_id"] = thread_id
             topic_data["_pending_thread_text"] = text
+            topic_data["_pending_user_id"] = user.id
         await safe_reply(update.message, msg_text, reply_markup=keyboard)
         return
 
@@ -1414,8 +1507,29 @@ async def text_handler(
     # This catches UIs (permission prompts, etc.) that status polling might have missed.
     # capture_pane is a local tmux call, but handle_interactive_ui hits the network —
     # isolate the whole block so a failure can't prevent the injection below.
+    pane_text: str | None = None
     try:
         pane_text = await tmux_manager.capture_pane(w.window_id)
+    except Exception as e:
+        logger.warning("pane capture failed, continuing to injection: %s", e)
+    # Claude's one-time Bypass warning is a "No, exit / Yes, I accept" menu:
+    # text plus Enter could exit Claude, so never forward text into it. Only
+    # windows CCBot launched in Bypass can show it.
+    bound_state = session_manager.window_states.get(wid)
+    if (
+        config.permission_choice
+        and bound_state is not None
+        and bound_state.skip_permissions
+        and pane_text
+        and is_bypass_warning(pane_text)
+    ):
+        try:
+            await handle_interactive_ui(context.bot, route_id, wid, thread_id)
+        except Exception as e:
+            logger.warning("Could not show the Bypass warning controls: %s", e)
+        await safe_reply(update.message, BYPASS_WARNING_NOTICE)
+        return
+    try:
         if pane_text and is_interactive_ui(pane_text):
             # UI detected — show it to user, then send text (acts as Enter)
             logger.info(
@@ -1483,6 +1597,107 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # --- Window creation helper ---
 
 
+def _snapshot_pending(
+    topic_data: dict | None,
+) -> tuple[str | None, int | None]:
+    """Capture the setup's first message and initiator before any await.
+
+    Another user's message during window creation can replace these keys;
+    only the snapshot may be forwarded to the new window.
+    """
+    if topic_data is None:
+        return None, None
+    return topic_data.get("_pending_thread_text"), topic_data.get("_pending_user_id")
+
+
+def _release_pending(
+    topic_data: dict | None,
+    thread_id: int | None,
+    text: str | None,
+    user_id: int | None,
+) -> None:
+    """Pop the pending keys only while they still belong to this setup."""
+    if (
+        topic_data is not None
+        and topic_data.get("_pending_thread_id") == thread_id
+        and topic_data.get("_pending_thread_text") == text
+        and topic_data.get("_pending_user_id") == user_id
+    ):
+        topic_data.pop("_pending_thread_id", None)
+        topic_data.pop("_pending_thread_text", None)
+        topic_data.pop("_pending_user_id", None)
+
+
+async def _begin_window_creation(
+    query: object,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: object,
+    selected_path: str,
+    pending_thread_id: int | None,
+    resume_session_id: str | None = None,
+    resume_summary: str | None = None,
+    pending_text: str | None = None,
+    pending_user_id: int | None = None,
+) -> None:
+    """Start a picked session, asking for the permission mode first when enabled.
+
+    Shared by CB_DIR_CONFIRM (no sessions), CB_SESSION_NEW, and CB_SESSION_SELECT.
+    With CCBOT_PERMISSION_CHOICE off this is exactly _create_and_bind_window.
+    pending_text/pending_user_id are the caller's _snapshot_pending result.
+    """
+    if not config.permission_choice:
+        await _create_and_bind_window(
+            query,
+            context,
+            user,
+            selected_path,
+            pending_thread_id,
+            resume_session_id=resume_session_id,
+            pending_text=pending_text,
+            pending_user_id=pending_user_id,
+        )
+        return
+
+    from telegram import CallbackQuery, User
+
+    assert isinstance(query, CallbackQuery)
+    assert isinstance(user, User)
+
+    if pending_thread_id is None and query.message is not None:
+        tid = getattr(query.message, "message_thread_id", None)
+        pending_thread_id = tid if tid not in (None, 1) else None
+    topic_data = get_topic_data(context, pending_thread_id)
+    if topic_data is None:
+        await query.answer("Open this control in its original topic", show_alert=True)
+        return
+    route_id = conversation_id(
+        user.id, query.message.chat.id if query.message else None
+    )
+    if (
+        config.chat_scoped_topics
+        and pending_thread_id is not None
+        and session_manager.get_window_for_thread(route_id, pending_thread_id)
+    ):
+        await query.answer("This topic already has a session", show_alert=True)
+        return
+
+    token = secrets.token_hex(4)
+    topic_data[STATE_KEY] = STATE_SELECTING_PERMISSION
+    topic_data[PERM_PENDING_KEY] = {
+        "path": selected_path,
+        "resume_session_id": resume_session_id,
+        "thread_id": pending_thread_id,
+        "user_id": user.id,
+        "token": token,
+        "text": pending_text,
+        "text_user_id": pending_user_id,
+    }
+    # _pending_thread_id/_pending_thread_text stay until the choice is made.
+    text, keyboard = build_permission_picker(selected_path, token, resume_summary)
+    await safe_edit(query, text, reply_markup=keyboard)
+    await query.answer()
+
+
 async def _create_and_bind_window(
     query: object,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1490,10 +1705,17 @@ async def _create_and_bind_window(
     selected_path: str,
     pending_thread_id: int | None,
     resume_session_id: str | None = None,
+    skip_permissions: bool = False,
+    pending_text: str | None = None,
+    pending_user_id: int | None = None,
 ) -> None:
     """Create a tmux window, bind it to a topic, and forward pending text.
 
-    Shared by CB_DIR_CONFIRM (no sessions), CB_SESSION_NEW, and CB_SESSION_SELECT.
+    Reached through _begin_window_creation, directly or after the permission
+    picker. skip_permissions launches Claude in Bypass mode and is recorded
+    on the window state so /recover relaunches the same way. pending_text and
+    pending_user_id are snapshotted by the caller before its first await;
+    topic data is never re-read for the text after the awaits below.
     """
     from telegram import CallbackQuery, User
 
@@ -1513,17 +1735,20 @@ async def _create_and_bind_window(
         return
 
     success, message, created_wname, created_wid = await tmux_manager.create_window(
-        selected_path, resume_session_id=resume_session_id
+        selected_path,
+        resume_session_id=resume_session_id,
+        skip_permissions=skip_permissions,
     )
     if success:
         logger.info(
-            "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s)",
+            "Window created: %s (id=%s) at %s (user=%d, thread=%s, resume=%s, mode=%s)",
             created_wname,
             created_wid,
             selected_path,
             user.id,
             pending_thread_id,
             resume_session_id,
+            "bypass" if skip_permissions else "normal",
         )
         # Wait for Claude Code's SessionStart hook to register in session_map.
         # Resume sessions take longer to start (loading session state), so use
@@ -1571,30 +1796,71 @@ async def _create_and_bind_window(
             )
 
         if pending_thread_id is not None:
+            # Record the launch mode right before bind_thread (which saves) with
+            # no await in between: load_session_map drops unbound window states.
+            if skip_permissions:
+                session_manager.get_window_state(created_wid).skip_permissions = True
+            elif created_wid in session_manager.window_states:
+                session_manager.window_states[created_wid].skip_permissions = False
             # Thread bind flow: bind thread to newly created window
             session_manager.bind_thread(
                 route_id, pending_thread_id, created_wid, window_name=created_wname
             )
 
             status = "Resumed" if resume_session_id else "Created"
+            mode_line = ""
+            if config.permission_choice:
+                mode_line = (
+                    "\n\nMode: ⚠️ Bypass — permission checks are skipped."
+                    if skip_permissions
+                    else "\n\nMode: 🛡 Normal"
+                )
             await safe_edit(
                 query,
-                f"✅ {message}\n\n{status}. Send messages here.",
+                f"✅ {message}\n\n{status}. Send messages here.{mode_line}",
             )
 
-            # Send pending text if any
-            pending_text = (
-                topic_data.get("_pending_thread_text") if topic_data else None
-            )
-            if pending_text:
+            # Send the snapshotted pending text, if any
+            # Claude's one-time Bypass warning is a "No, exit / Yes, I accept"
+            # menu; forwarding text plus Enter could pick "No, exit". Fail
+            # closed: hold the text unless the hook confirmed startup and the
+            # pane is readable and shows no warning.
+            hold_notice: str | None = None
+            if pending_text and skip_permissions:
+                bypass_pane = await tmux_manager.capture_pane(created_wid)
+                if bypass_pane is not None and is_bypass_warning(bypass_pane):
+                    hold_notice = BYPASS_WARNING_NOTICE
+                elif bypass_pane is None or not hook_ok:
+                    hold_notice = BYPASS_STARTING_NOTICE
+            if pending_text and hold_notice:
+                logger.info(
+                    "Holding pending text for Bypass window %s (hook_ok=%s)",
+                    created_wid,
+                    hook_ok,
+                )
+                _release_pending(
+                    topic_data, pending_thread_id, pending_text, pending_user_id
+                )
+                sent = await safe_send(
+                    context.bot,
+                    session_manager.resolve_chat_id(route_id, pending_thread_id),
+                    hold_notice,
+                    message_thread_id=pending_thread_id,
+                )
+                if sent is None:
+                    logger.warning(
+                        "Could not tell topic %s that its first message was held",
+                        pending_thread_id,
+                    )
+            elif pending_text:
                 logger.debug(
                     "Forwarding pending text to window %s (len=%d)",
                     created_wname,
                     len(pending_text),
                 )
-                if topic_data is not None:
-                    topic_data.pop("_pending_thread_text", None)
-                    topic_data.pop("_pending_thread_id", None)
+                _release_pending(
+                    topic_data, pending_thread_id, pending_text, pending_user_id
+                )
                 send_ok, send_msg = await session_manager.send_to_window(
                     created_wid,
                     pending_text,
@@ -1610,16 +1876,19 @@ async def _create_and_bind_window(
                         f"❌ Failed to send pending message: {send_msg}",
                         message_thread_id=pending_thread_id,
                     )
-            elif topic_data is not None:
-                topic_data.pop("_pending_thread_id", None)
+            else:
+                _release_pending(
+                    topic_data, pending_thread_id, pending_text, pending_user_id
+                )
         else:
             # Should not happen in topic-only mode, but handle gracefully
             await safe_edit(query, f"✅ {message}")
     else:
         await safe_edit(query, f"❌ {message}")
-        if pending_thread_id is not None and topic_data is not None:
-            topic_data.pop("_pending_thread_id", None)
-            topic_data.pop("_pending_thread_text", None)
+        if pending_thread_id is not None:
+            _release_pending(
+                topic_data, pending_thread_id, pending_text, pending_user_id
+            )
     await query.answer("Created" if success else "Failed")
 
 
@@ -1641,7 +1910,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     data = query.data
-    if config.fixed_workdir and data.startswith(("db:", "wb:", "rs:")):
+    if config.fixed_workdir and data.startswith(("db:", "wb:", "rs:", CB_PERM_PREFIX)):
         await query.answer(
             "This bot uses a fixed workspace. Send a message in the topic to continue.",
             show_alert=True,
@@ -1659,6 +1928,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     topic_data = get_topic_data(context, _get_thread_id(update))
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(route_id, cb_thread_id, chat.id)
+
+    # Setup pickers (window picker, directory browser, session picker) belong
+    # to whoever sent the message that opened them; pm: checks its own record.
+    # Any allowed user may cancel; selecting, starting and binding may not.
+    if (
+        data.startswith(("db:", "rs:", "wb:"))
+        and data not in (CB_DIR_CANCEL, CB_SESSION_CANCEL, CB_WIN_CANCEL)
+        and topic_data is not None
+        and topic_data.get("_pending_user_id") not in (None, user.id)
+    ):
+        await query.answer(SETUP_OWNER_ONLY, show_alert=True)
+        return
 
     # History: older/newer pagination
     # Format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>
@@ -1798,12 +2079,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer()
 
     elif data == CB_DIR_CONFIRM:
-        default_path = str(Path.cwd())
-        selected_path = (
-            topic_data.get(BROWSE_PATH_KEY, default_path)
-            if topic_data
-            else default_path
-        )
         # Check if this was initiated from a thread bind flow
         pending_thread_id: int | None = (
             topic_data.get("_pending_thread_id") if topic_data else None
@@ -1816,9 +2091,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if topic_data is not None:
                 topic_data.pop("_pending_thread_id", None)
                 topic_data.pop("_pending_thread_text", None)
+                topic_data.pop("_pending_user_id", None)
             await query.answer("Stale browser (topic mismatch)", show_alert=True)
             return
 
+        # A second tap (or an old browser) must not fall back to another
+        # directory. No await between this check and clearing the state.
+        selected_path = topic_data.get(BROWSE_PATH_KEY) if topic_data else None
+        if (
+            topic_data is None
+            or topic_data.get(STATE_KEY) != STATE_BROWSING_DIRECTORY
+            or not selected_path
+        ):
+            await query.answer(CHOICE_EXPIRED, show_alert=True)
+            return
+
+        snap_text, snap_user = _snapshot_pending(topic_data)
         clear_browse_state(topic_data)
 
         # Check for existing sessions in this directory
@@ -1834,9 +2122,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer()
             return
 
-        # No existing sessions — create new window directly
-        await _create_and_bind_window(
-            query, context, user, selected_path, pending_thread_id
+        # No existing sessions — create new window (after the mode step if on)
+        await _begin_window_creation(
+            query,
+            context,
+            user,
+            selected_path,
+            pending_thread_id,
+            pending_text=snap_text,
+            pending_user_id=snap_user,
         )
 
     elif data == CB_DIR_CANCEL:
@@ -1848,8 +2142,55 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if topic_data is not None:
             topic_data.pop("_pending_thread_id", None)
             topic_data.pop("_pending_thread_text", None)
+            topic_data.pop("_pending_user_id", None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
+
+    # Permission mode picker (CCBOT_PERMISSION_CHOICE): pm:<n|b|x>:<token>
+    elif data.startswith(CB_PERM_PREFIX):
+        choice, _, token = data[len(CB_PERM_PREFIX) :].partition(":")
+        pending = topic_data.get(PERM_PENDING_KEY) if topic_data else None
+        # No await between these checks and clearing the state below, so a
+        # double tap cannot start two windows.
+        if (
+            topic_data is None
+            or not config.permission_choice
+            or not isinstance(pending, dict)
+            or topic_data.get(STATE_KEY) != STATE_SELECTING_PERMISSION
+            or pending.get("token") != token
+        ):
+            await query.answer(CHOICE_EXPIRED, show_alert=True)
+            return
+        pending_tid = pending.get("thread_id")
+        if pending_tid is not None and cb_thread_id != pending_tid:
+            await query.answer("Stale picker (topic mismatch)", show_alert=True)
+            return
+        if choice == "x":
+            clear_permission_picker_state(topic_data)
+            topic_data.pop("_pending_thread_id", None)
+            topic_data.pop("_pending_thread_text", None)
+            topic_data.pop("_pending_user_id", None)
+            await safe_edit(query, "Cancelled")
+            await query.answer("Cancelled")
+            return
+        if pending.get("user_id") != user.id:
+            await query.answer(SETUP_OWNER_ONLY, show_alert=True)
+            return
+        if choice not in ("n", "b"):
+            await query.answer("Invalid data")
+            return
+        clear_permission_picker_state(topic_data)
+        await _create_and_bind_window(
+            query,
+            context,
+            user,
+            pending["path"],
+            pending_tid,
+            resume_session_id=pending.get("resume_session_id"),
+            skip_permissions=choice == "b",
+            pending_text=pending.get("text"),
+            pending_user_id=pending.get("text_user_id"),
+        )
 
     # Session picker: resume existing session
     elif data.startswith(CB_SESSION_SELECT):
@@ -1867,28 +2208,35 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await query.answer("Invalid data")
             return
 
-        cached_sessions = topic_data.get(SESSIONS_KEY, []) if topic_data else []
+        selected_path = topic_data.get("_selected_path") if topic_data else None
+        if (
+            topic_data is None
+            or topic_data.get(STATE_KEY) != STATE_SELECTING_SESSION
+            or not selected_path
+        ):
+            await query.answer(CHOICE_EXPIRED, show_alert=True)
+            return
+        cached_sessions = topic_data.get(SESSIONS_KEY, [])
         if idx < 0 or idx >= len(cached_sessions):
             await query.answer("Session not found")
             return
 
         session = cached_sessions[idx]
-        selected_path = (
-            topic_data.get("_selected_path", str(Path.cwd()))
-            if topic_data
-            else str(Path.cwd())
-        )
+        snap_text, snap_user = _snapshot_pending(topic_data)
         clear_session_picker_state(topic_data)
         if topic_data is not None:
             topic_data.pop("_selected_path", None)
 
-        await _create_and_bind_window(
+        await _begin_window_creation(
             query,
             context,
             user,
             selected_path,
             pending_tid,
             resume_session_id=session.session_id,
+            resume_summary=session.summary,
+            pending_text=snap_text,
+            pending_user_id=snap_user,
         )
 
     elif data == CB_SESSION_NEW:
@@ -1898,16 +2246,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if pending_tid is not None and _get_thread_id(update) != pending_tid:
             await query.answer("Stale picker (topic mismatch)", show_alert=True)
             return
-        selected_path = (
-            topic_data.get("_selected_path", str(Path.cwd()))
-            if topic_data
-            else str(Path.cwd())
-        )
+        selected_path = topic_data.get("_selected_path") if topic_data else None
+        if (
+            topic_data is None
+            or topic_data.get(STATE_KEY) != STATE_SELECTING_SESSION
+            or not selected_path
+        ):
+            await query.answer(CHOICE_EXPIRED, show_alert=True)
+            return
+        snap_text, snap_user = _snapshot_pending(topic_data)
         clear_session_picker_state(topic_data)
         if topic_data is not None:
             topic_data.pop("_selected_path", None)
 
-        await _create_and_bind_window(query, context, user, selected_path, pending_tid)
+        await _begin_window_creation(
+            query,
+            context,
+            user,
+            selected_path,
+            pending_tid,
+            pending_text=snap_text,
+            pending_user_id=snap_user,
+        )
 
     elif data == CB_SESSION_CANCEL:
         pending_tid = topic_data.get("_pending_thread_id") if topic_data else None
@@ -1918,6 +2278,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if topic_data is not None:
             topic_data.pop("_pending_thread_id", None)
             topic_data.pop("_pending_thread_text", None)
+            topic_data.pop("_pending_user_id", None)
             topic_data.pop("_selected_path", None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
@@ -1974,6 +2335,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         display = w.window_name
         clear_window_picker_state(topic_data)
+        # CCBot cannot tell how an existing window was launched; record Normal
+        # so a recycled window ID never carries a stale Bypass mode.
+        if selected_wid in session_manager.window_states:
+            session_manager.window_states[selected_wid].skip_permissions = False
         session_manager.bind_thread(
             route_id, thread_id, selected_wid, window_name=display
         )
@@ -1987,6 +2352,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         pending_text = topic_data.get("_pending_thread_text") if topic_data else None
         if topic_data is not None:
             topic_data.pop("_pending_thread_text", None)
+            topic_data.pop("_pending_user_id", None)
             topic_data.pop("_pending_thread_id", None)
         if pending_text:
             send_ok, send_msg = await session_manager.send_to_window(
@@ -2031,6 +2397,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if topic_data is not None:
             topic_data.pop("_pending_thread_id", None)
             topic_data.pop("_pending_thread_text", None)
+            topic_data.pop("_pending_user_id", None)
         await safe_edit(query, "Cancelled")
         await query.answer("Cancelled")
 
