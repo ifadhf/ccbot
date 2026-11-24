@@ -8,7 +8,12 @@ This module must NOT import config.py (which requires TELEGRAM_BOT_TOKEN),
 since hooks run inside tmux panes where bot env vars are not set.
 Config directory resolution uses utils.ccbot_dir() (shared with config.py).
 
-Key functions: hook_main() (CLI entry), _install_hook().
+Stop/Notification events send a Telegram notification that mentions the
+topic owner. Only the newest mentioned notification per topic keeps its
+mention: the previous one (tracked in <CCBOT_DIR>/notify_last.json) is
+deleted, or edited to drop the mention (CCBOT_NOTIFY_SINGLE_MENTION).
+
+Key functions: hook_main() (CLI entry), _install_hook(), _notify_telegram().
 """
 
 import argparse
@@ -21,7 +26,9 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple, TypeGuard
 
 logger = logging.getLogger(__name__)
 
@@ -386,21 +393,57 @@ _NOTIFY_RETRY_DELAYS: tuple[float, ...] = (3.0, 10.0, 30.0, 60.0, 120.0, 240.0)
 # the stderr of a hook that exits 0. Rotated once it exceeds this size.
 _NOTIFY_LOG_MAX_BYTES = 512 * 1024
 
+# Removing the previous mention is a single best-effort request per method:
+# it must never hold up or block the new notification.
+_NOTIFY_CLEANUP_TIMEOUT = 10.0
+# Records in notify_last.json older than this are dropped on the next write.
+_NOTIFY_LAST_MAX_AGE = 30 * 24 * 3600.0
+# Old notifications whose cleanup failed transiently, retried on the next
+# mentioned notification in the topic; the oldest are dropped beyond this.
+_NOTIFY_PENDING_MAX = 5
+# Set to false/0/no/off (env or <ccbot_dir>/.env) to keep every mention.
+_SINGLE_MENTION_ENV = "CCBOT_NOTIFY_SINGLE_MENTION"
+_FALSE_VALUES = frozenset({"false", "0", "no", "off"})
+
+
+def _parse_env_value(raw: str) -> str:
+    """Parse a .env value like python-dotenv: quotes, or an inline ' #' comment."""
+    raw = raw.strip()
+    quoted = re.match(r"""^(['"])(.*?)\1""", raw)
+    if quoted:
+        return quoted.group(2)
+    return re.split(r"\s+#", raw, maxsplit=1)[0].strip()
+
+
+def _read_hook_env(ccbot_dir_path: Path, name: str) -> str:
+    """Read setting name from env or <ccbot_dir>/.env (no config import).
+
+    In .env the last matching line wins, as with python-dotenv.
+    """
+    value = os.environ.get(name, "")
+    if value:
+        return value
+    pattern = re.compile(rf"^(?:export\s+)?{re.escape(name)}\s*=(.*)$")
+    found = ""
+    try:
+        for line in (ccbot_dir_path / ".env").read_text().splitlines():
+            match = pattern.match(line.strip())
+            if match:
+                found = _parse_env_value(match.group(1))
+    except (OSError, ValueError):
+        pass
+    return found
+
 
 def _read_bot_token(ccbot_dir_path: Path) -> str:
     """Read TELEGRAM_BOT_TOKEN from env or <ccbot_dir>/.env (no config import)."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    if token:
-        return token
-    env_file = ccbot_dir_path / ".env"
-    try:
-        for line in env_file.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("TELEGRAM_BOT_TOKEN="):
-                return line.split("=", 1)[1].strip().strip("'\"")
-    except OSError:
-        pass
-    return ""
+    return _read_hook_env(ccbot_dir_path, "TELEGRAM_BOT_TOKEN")
+
+
+def _single_mention_enabled(cfg_dir: Path) -> bool:
+    """Return False when CCBOT_NOTIFY_SINGLE_MENTION is false, 0, no or off."""
+    value = _read_hook_env(cfg_dir, _SINGLE_MENTION_ENV)
+    return value.strip().lower() not in _FALSE_VALUES
 
 
 def _get_user_mention(user_id: str, token: str, cfg_dir: Path) -> str:
@@ -470,11 +513,13 @@ def _telegram_error_detail(error: Exception) -> tuple[str, int | None]:
     return description, retry_after if isinstance(retry_after, int) else None
 
 
-def _post_with_retry(token: str, data: bytes, label: str, cfg_dir: Path) -> bool:
+def _post_with_retry(token: str, data: bytes, label: str, cfg_dir: Path) -> dict | None:
     """POST sendMessage, retrying timeouts, network errors, 429 and 5xx.
 
     Other 4xx responses are permanent (bad chat or topic) and are not
-    retried. Returns True once Telegram accepts the message.
+    retried. Once Telegram accepts the message, returns the Bot API result
+    (the sent Message), or {} if the response body cannot be decoded.
+    Returns None when the message was not delivered.
     """
     import time
     import urllib.error
@@ -487,16 +532,20 @@ def _post_with_retry(token: str, data: bytes, label: str, cfg_dir: Path) -> bool
             with urllib.request.urlopen(
                 urllib.request.Request(url, data=data), timeout=_NOTIFY_HTTP_TIMEOUT
             ) as resp:
+                try:
+                    result = json.loads(resp.read()).get("result")
+                except Exception:  # odd body: still sent, just untracked
+                    result = None
                 _log_notify(
                     cfg_dir,
                     f"{label}: sent (HTTP {resp.status}, attempt {attempt}/{attempts})",
                 )
-                return True
+                return result if isinstance(result, dict) else {}
         except urllib.error.HTTPError as e:
             description, retry_after = _telegram_error_detail(e)
             if e.code != 429 and e.code < 500:
                 _log_notify(cfg_dir, f"{label}: rejected (HTTP {e.code} {description})")
-                return False
+                return None
             error = f"HTTP {e.code} {description}".strip()
             if delay is not None and retry_after:
                 delay = max(delay, float(retry_after))
@@ -507,14 +556,306 @@ def _post_with_retry(token: str, data: bytes, label: str, cfg_dir: Path) -> bool
             _log_notify(
                 cfg_dir, f"{label}: gave up after {attempts} attempts ({error})"
             )
-            return False
+            return None
         _log_notify(
             cfg_dir,
             f"{label}: attempt {attempt}/{attempts} failed ({error}), "
             f"retrying in {delay:.0f}s",
         )
         time.sleep(delay)
-    return False
+    return None
+
+
+class _CallResult(NamedTuple):
+    """Outcome of a single Bot API request made by _telegram_call_once."""
+
+    ok: bool
+    error: str = ""
+    transient: bool = False  # 429, 5xx or a network error: worth retrying
+
+
+def _telegram_call_once(token: str, method: str, params: dict) -> _CallResult:
+    """POST one Bot API request without retries.
+
+    Never raises and never logs; the caller decides what to record. The
+    token is stripped from any error text.
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = urllib.parse.urlencode(params).encode()
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, data=data), timeout=_NOTIFY_CLEANUP_TIMEOUT
+        ):
+            return _CallResult(True)
+    except urllib.error.HTTPError as e:
+        description, _ = _telegram_error_detail(e)
+        error = f"HTTP {e.code} {description}".strip().replace(token, "***")
+        return _CallResult(False, error, e.code == 429 or e.code >= 500)
+    except Exception as e:  # timeouts, resets, DNS and TLS failures
+        error = f"{type(e).__name__}: {e}".replace(token, "***")[:200]
+        return _CallResult(False, error, True)
+
+
+def _notification_texts(event: str, mention: str) -> tuple[str, str]:
+    """Return (text, plain): the HTML message and its text without mention."""
+    if event == "Stop":
+        plain = "✅ Task selesai"
+        return f"{plain} — menunggu input {mention}".rstrip(), plain
+    # Notification: always generic. The real payload message (e.g. "Claude
+    # needs your permission") is misleading for non-risky prompts like
+    # AskUserQuestion, which also fires notification_type=permission_prompt.
+    plain = "🔔 Claude needs your attention"
+    return (f"{plain} — {mention}" if mention else plain), plain
+
+
+def _valid_message_id(value: object) -> TypeGuard[int]:
+    """Return True for a positive int Telegram message_id (bool excluded)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _load_last_notifications(path: Path) -> dict:
+    """Read notify_last.json; a missing or corrupt file counts as empty."""
+    try:
+        records = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return records if isinstance(records, dict) else {}
+
+
+def _clean_pending(entries: object, newest_id: int) -> list[dict]:
+    """Return well-formed pending entries older than newest_id, oldest first.
+
+    Entries at or above newest_id are dropped: cleanup must never touch the
+    tracked newest mention or anything sent after it.
+    """
+    if not isinstance(entries, list):
+        return []
+    kept: list[dict] = []
+    seen = {newest_id}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        mid = entry.get("message_id")
+        if not _valid_message_id(mid) or mid in seen or mid > newest_id:
+            continue
+        plain = entry.get("plain")
+        seen.add(mid)
+        kept.append(
+            {"message_id": mid, "plain": plain if isinstance(plain, str) else ""}
+        )
+    # Message ids grow over time, so the lowest ids are the oldest to drop.
+    kept.sort(key=lambda entry: entry["message_id"])
+    return kept
+
+
+def _valid_pending(entries: object, newest_id: int) -> list[dict]:
+    """Keep the newest _NOTIFY_PENDING_MAX clean pending entries."""
+    return _clean_pending(entries, newest_id)[-_NOTIFY_PENDING_MAX:]
+
+
+def _prune_last_notifications(records: dict, now: float) -> dict:
+    """Drop malformed records and records older than _NOTIFY_LAST_MAX_AGE."""
+    kept: dict = {}
+    for key, record in records.items():
+        if not isinstance(record, dict) or not _valid_message_id(
+            record.get("message_id")
+        ):
+            continue
+        sent_at = record.get("sent_at")
+        if not isinstance(sent_at, (int, float)) or isinstance(sent_at, bool):
+            continue
+        if now - sent_at > _NOTIFY_LAST_MAX_AGE:
+            continue
+        pending = _valid_pending(record.get("pending"), record["message_id"])
+        record = {k: v for k, v in record.items() if k != "pending"}
+        if pending:
+            record["pending"] = pending
+        kept[key] = record
+    return kept
+
+
+def _update_last_notifications(cfg_dir: Path, update: Callable[[dict], None]) -> None:
+    """Apply update to notify_last.json under an exclusive lock.
+
+    The lock covers only this read/modify/write; raises OSError on failure.
+    The file is always rewritten, so pruning and corrupt-file repair persist.
+    """
+    import time
+
+    from .utils import atomic_write_json
+
+    path = cfg_dir / "notify_last.json"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(cfg_dir / "notify_last.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+") as lock_f:
+        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        records = _prune_last_notifications(_load_last_notifications(path), time.time())
+        update(records)
+        atomic_write_json(path, records)
+
+
+def _swap_last_notification(
+    cfg_dir: Path, key: str, record: dict, label: str
+) -> list[dict] | None:
+    """Store record as the topic's newest mention; return the ones to retire.
+
+    Telegram message ids grow within a chat, so the higher id wins: a late
+    older send (e.g. after long retries) retires its own message instead of
+    the newer one. The returned list holds {"message_id", "plain"} entries:
+    the superseded message plus any pending cleanups from earlier failures.
+    Returns None when the file cannot be updated (nothing is retired then).
+    """
+    to_retire: list[dict] = []
+    newest = record["message_id"]
+
+    def update(records: dict) -> None:
+        nonlocal newest
+        old = records.get(key)
+        if old is not None and old["message_id"] > record["message_id"]:
+            newest = old["message_id"]
+            to_retire.append(record)
+            to_retire.extend(old.pop("pending", []))
+        elif old is not None and old["message_id"] == record["message_id"]:
+            return
+        else:
+            records[key] = {k: v for k, v in record.items() if k != "pending"}
+            if old is not None:
+                to_retire.append(old)
+                to_retire.extend(old.get("pending", []))
+
+    try:
+        _update_last_notifications(cfg_dir, update)
+    except OSError as e:
+        _log_notify(
+            cfg_dir,
+            f"{label}: could not update notify_last.json "
+            f"({type(e).__name__}: {e}), new mention {record['message_id']} "
+            "untracked, previous mention kept",
+        )
+        return None
+    return [
+        {"message_id": entry["message_id"], "plain": entry.get("plain", "")}
+        for entry in to_retire
+        if entry["message_id"] < newest
+    ]
+
+
+def _requeue_pending(cfg_dir: Path, key: str, entries: list[dict], label: str) -> None:
+    """Add transiently failed cleanups to the topic's pending list."""
+
+    def id_list(items: list) -> str:
+        return ", ".join(str(item) for item in items)
+
+    ids = id_list([entry["message_id"] for entry in entries])
+    outcome: list[str] = []
+
+    def update(records: dict) -> None:
+        current = records.get(key)
+        if current is None:
+            outcome.append(f"cleanup of {ids} dropped, no record for the topic")
+            return
+        candidates = _clean_pending(
+            [*current.get("pending", []), *entries], current["message_id"]
+        )
+        pending = candidates[-_NOTIFY_PENDING_MAX:]
+        trimmed = [entry["message_id"] for entry in candidates[:-_NOTIFY_PENDING_MAX]]
+        if pending:
+            current["pending"] = pending
+        else:
+            current.pop("pending", None)
+        kept_ids = {entry["message_id"] for entry in pending}
+        queued = [e["message_id"] for e in entries if e["message_id"] in kept_ids]
+        skipped = [
+            e["message_id"]
+            for e in entries
+            if e["message_id"] not in kept_ids and e["message_id"] not in trimmed
+        ]
+        if queued:
+            outcome.append(f"cleanup of {id_list(queued)} queued for retry")
+        if skipped:
+            outcome.append(
+                f"cleanup of {id_list(skipped)} not queued (not older than "
+                f"tracked mention {current['message_id']})"
+            )
+        if trimmed:
+            outcome.append(
+                f"pending cleanup over limit of {_NOTIFY_PENDING_MAX}, "
+                f"dropped {id_list(trimmed)}"
+            )
+
+    try:
+        _update_last_notifications(cfg_dir, update)
+    except OSError as e:
+        _log_notify(
+            cfg_dir,
+            f"{label}: could not queue cleanup of {ids} ({type(e).__name__}: {e})",
+        )
+        return
+    for line in outcome:
+        _log_notify(cfg_dir, f"{label}: {line}")
+
+
+def _retire_notification(
+    token: str, cfg_dir: Path, chat_id: int, stale: dict, label: str
+) -> bool:
+    """Delete a superseded notification, or edit it to drop the mention.
+
+    Returns True when cleanup failed transiently (429, 5xx or a network
+    error) and is worth retrying later; permanent failures are only logged.
+    """
+    mid = stale["message_id"]
+    deleted = _telegram_call_once(
+        token, "deleteMessage", {"chat_id": chat_id, "message_id": mid}
+    )
+    if deleted.ok:
+        _log_notify(cfg_dir, f"{label}: deleted previous mention {mid}")
+        return False
+    if "message to delete not found" in deleted.error.lower():
+        _log_notify(cfg_dir, f"{label}: previous mention {mid} already gone")
+        return False
+    plain = stale.get("plain")
+    if not isinstance(plain, str) or not plain:
+        _log_notify(
+            cfg_dir,
+            f"{label}: cleanup of {mid} failed (delete: {deleted.error}; "
+            "no plain text to edit)",
+        )
+        return deleted.transient
+    # No parse_mode: plain text, so no mention entity survives the edit.
+    edited = _telegram_call_once(
+        token,
+        "editMessageText",
+        {"chat_id": chat_id, "message_id": mid, "text": plain},
+    )
+    lowered = edited.error.lower()
+    if edited.ok:
+        _log_notify(
+            cfg_dir,
+            f"{label}: stripped mention from {mid} (delete failed: {deleted.error})",
+        )
+        return False
+    if "message to edit not found" in lowered:
+        _log_notify(
+            cfg_dir, f"{label}: previous mention {mid} already gone (edit: not found)"
+        )
+        return False
+    if "message is not modified" in lowered:
+        _log_notify(
+            cfg_dir,
+            f"{label}: previous mention {mid} already without mention (not modified)",
+        )
+        return False
+    _log_notify(
+        cfg_dir,
+        f"{label}: cleanup of {mid} failed (delete: {deleted.error}; "
+        f"edit: {edited.error})",
+    )
+    # A later attempt may succeed if either step failed for a passing reason.
+    return deleted.transient or edited.transient
 
 
 def _detach() -> bool:
@@ -548,7 +889,12 @@ def _deliver_notification(
     window_id: str,
     target: tuple[int, int, str],
 ) -> None:
-    """Build the notification text for target and send it with retries."""
+    """Build the notification text for target and send it with retries.
+
+    After a mentioned notification is sent, the topic's previous mentioned
+    notification is retired (see _swap_last_notification).
+    """
+    import time
     import urllib.parse
 
     chat_id, thread_id, user_id = target
@@ -571,15 +917,7 @@ def _deliver_notification(
     else:
         # Legacy private bindings identify a user; shared group IDs do not.
         mention = _get_user_mention(user_id, token, cfg_dir) if int(user_id) > 0 else ""
-    if event == "Stop":
-        text = f"✅ Task selesai — menunggu input {mention}".rstrip()
-    else:  # Notification
-        # Always generic: the real payload message (e.g. "Claude needs your
-        # permission") is misleading for non-risky prompts like AskUserQuestion,
-        # which also fires notification_type=permission_prompt.
-        text = "🔔 Claude needs your attention"
-        if mention:
-            text += f" — {mention}"
+    text, plain = _notification_texts(event, mention)
 
     data = urllib.parse.urlencode(
         {
@@ -590,7 +928,36 @@ def _deliver_notification(
             "disable_notification": "false",
         }
     ).encode()
-    _post_with_retry(token, data, label, cfg_dir)
+    result = _post_with_retry(token, data, label, cfg_dir)
+    if result is None or not mention or not _single_mention_enabled(cfg_dir):
+        return
+
+    message_id = result.get("message_id")
+    if not _valid_message_id(message_id):
+        _log_notify(
+            cfg_dir, f"{label}: sent without a message_id, previous mention kept"
+        )
+        return
+    record = {
+        "message_id": message_id,
+        "event": event,
+        "plain": plain,
+        "sent_at": time.time(),
+    }
+    key = f"{chat_id}:{thread_id}"
+    stale = _swap_last_notification(cfg_dir, key, record, label)
+    if not stale:
+        return
+    retry: list[dict] = []
+    for entry in stale:
+        try:
+            if _retire_notification(token, cfg_dir, chat_id, entry, label):
+                retry.append(entry)
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}".replace(token, "***")[:200]
+            _log_notify(cfg_dir, f"{label}: cleanup error ({error})")
+    if retry:
+        _requeue_pending(cfg_dir, key, retry, label)
 
 
 def _notify_telegram(event: str, payload: dict, detach: bool = False) -> None:
