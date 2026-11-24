@@ -1,6 +1,6 @@
 # CCBot customizations
 
-Version `0.1.0+custom.5` extends `ifadhf/ccbot` at
+Version `0.1.0+custom.6` extends `ifadhf/ccbot` at
 `f2019b96081a0a7aa75a4478a1ef97c7a26ca84f` (`local-patches`). It supports private
 groups for individual users and a shared group, with an independent Claude
 session for each named Telegram topic.
@@ -44,7 +44,10 @@ Create the workspace first, with permissions for the account running CCBot.
 `CCBOT_FIXED_WORKDIR` must resolve to an existing absolute directory; leave it
 empty to retain the directory and session pickers. Restart CCBot after editing
 its configuration. Every flag above defaults to `false` (or empty) when
-omitted, for compatibility with existing installations. With them all off the
+omitted, for compatibility with existing installations. The one exception is
+`CCBOT_NOTIFY_SINGLE_MENTION`, which is on unless set to `false`, `0`, `no`
+or `off` (see
+[Notification mentions](#notification-mentions)). With them all off the
 bot behaves like the original laptop build: General-topic messages get the
 usual "use a named topic" reply, a lost window unbinds its topic, documents get
 the unsupported-content reply, and `ccbot files`/`send-file` refuse to run.
@@ -190,6 +193,46 @@ Claude Code keeps the original interface there, parked on the background job
 that pane, as it does for a pane running `claude attach <job>`, so a new
 session ID after `/clear` stays bound to its topic.
 
+## Notification mentions
+
+Claude Code sometimes fires several `Stop` events in a row while it is still
+working, and each one used to mention the topic owner again. Now only the
+newest mentioned notification in a topic keeps its mention, so the owner gets
+one ping per topic instead of a pile of them.
+
+`Stop` and `Notification` share the same slot per topic. After a new
+mentioned notification is sent, the hook deletes the previous one. If Telegram
+refuses the delete, the hook edits the old message to plain text without the
+mention. A previous message that is already gone counts as done. Every outcome
+is written to `$CCBOT_DIR/notify.log`.
+
+If both steps fail for a passing reason (HTTP 429, a 5xx error, or a network
+timeout), the old message is kept in a short `pending` list for that topic and
+retried with the next mentioned notification there. The list holds at most 5
+messages; beyond that the oldest are dropped. A permanent refusal (another 4xx
+error) is only logged, because retrying would not change the answer.
+Cleanup is best-effort: if the hook's background process is killed after it
+records the new mention but before cleanup finishes, the old mention stays.
+
+Cleanup runs only after the new message is delivered, uses one short request
+per step without retries, and never blocks or delays the new notification. If
+an older notification finishes its retries after a newer one was sent, the
+newer message keeps the mention and the late one is removed instead (Telegram
+message IDs grow within a chat). Shared topics without an owner send no
+mention, so they are not tracked and behave as before.
+
+The last mentioned message per topic, with its pending list, is stored in
+`$CCBOT_DIR/notify_last.json`. The file is safe to delete; entries older than
+30 days expire automatically. If the file cannot be written, the new message
+stays untracked and keeps its mention, and `notify.log` says so.
+
+Set `CCBOT_NOTIFY_SINGLE_MENTION=false` (or `0`, `no`, `off`) to keep every
+mention. The hook reads the flag from its own environment or `$CCBOT_DIR/.env`
+on every event, so no restart is needed. In `.env` the last matching line wins
+and an inline ` # comment` after an unquoted value is ignored, as with
+python-dotenv. Deleting the bot's own messages needs no extra admin
+rights.
+
 ## Existing installations
 
 Changing `CCBOT_CHAT_SCOPED_TOPICS` changes the meaning of saved routing keys.
@@ -217,7 +260,9 @@ uv run pytest --tb=short -q
 
 Regression tests cover cross-group routing, General-topic dispatch, ownership
 and callbacks, file boundaries and Telegram transport errors, hook installation,
-and fixed-workspace creation and retry behavior. Recovery tests cover cold
+fixed-workspace creation and retry behavior, and keeping only the newest
+notification mention per topic (delete, edit fallback, late sends, concurrent
+hooks, retrying transient cleanup failures, and the opt-out flag). Recovery tests cover cold
 startup, bot crashes during launch, reused IDs, failed topics, and retained
 owners and offsets. An integration test uses a unique tmux socket and a fake
 Claude CLI that invokes the real hook, then destroys only that test server to
