@@ -57,3 +57,7 @@ Or manually in `~/.claude/settings.json`:
 See @.claude/rules/architecture.md for full system diagram and module inventory.
 See @.claude/rules/topic-architecture.md for topic→window→session mapping details.
 See @.claude/rules/message-handling.md for message queue, merging, and rate limiting.
+
+## Development Workflow
+
+See @.claude/rules/dev-workflow.md for the plan, test-first, verify, and review flow. Project agents (`python-reviewer`, `security-reviewer`, `silent-failure-hunter`, `tdd-guide`) live in `.claude/agents/`; the `verify` skill in `.claude/skills/verify/` runs all quality gates.

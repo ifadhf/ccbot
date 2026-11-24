@@ -230,3 +230,20 @@ Ruff's original `E4`, `E7`, `E9`, and `F` rule selection is explicit in
 [Ruff 0.16 migration guidance](https://astral.sh/blog/ruff-v0.16.0) after its
 default rule set expanded. This keeps the project's previous lint scope stable
 across tool upgrades.
+
+## Development workflow for agents
+
+Claude Code sessions working on this repository load a development workflow
+adapted from [ECC](https://github.com/affaan-m/ECC) (MIT). Only the parts that
+fit a Python Telegram bot were taken, rewritten for CCBot's constraints; ECC's
+hook runtime was left out because it would run alongside `ccbot hook` in every
+session. Nothing here changes bot behavior.
+
+- `.claude/rules/dev-workflow.md`: read, plan, test first, verify, review, document.
+- `.claude/skills/verify/`: runs the Validation commands above plus scans for
+  committed tokens, stray `print()` calls, and handler code that bypasses the
+  MarkdownV2 helpers, then prints a PASS/FAIL report.
+- `.claude/agents/`: `python-reviewer` (correctness and CCBot conventions),
+  `security-reviewer` (access control, file transfer, tmux input, secrets),
+  `silent-failure-hunter` (swallowed errors and misleading fallbacks), and
+  `tdd-guide` (test-first implementation using the project's pytest conventions).
