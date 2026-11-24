@@ -1,6 +1,6 @@
 # CCBot customizations
 
-Version `0.1.0+custom.6` extends `ifadhf/ccbot` at
+Version `0.1.0+custom.7` extends `ifadhf/ccbot` at
 `f2019b96081a0a7aa75a4478a1ef97c7a26ca84f` (`local-patches`). It supports private
 groups for individual users and a shared group, with an independent Claude
 session for each named Telegram topic.
@@ -38,6 +38,7 @@ CCBOT_FIXED_WORKDIR=/srv/project
 CCBOT_IGNORE_GENERAL_TOPIC=true
 CCBOT_SESSION_RECOVERY=true
 CCBOT_FILE_TRANSFER=true
+# CCBOT_PERMISSION_CHOICE=true
 ```
 
 Create the workspace first, with permissions for the account running CCBot.
@@ -85,6 +86,81 @@ buttons cannot change the selection. Existing live bindings are preserved.
 The workspace setting controls the starting directory and picker flow. It does
 not restrict the operating-system account's filesystem access, and separate
 topics can edit files in the same workspace.
+
+## Permission mode choice
+
+Requires `CCBOT_PERMISSION_CHOICE=true`. It lets the person starting a topic
+session decide whether Claude asks before risky actions or runs every tool
+without asking.
+
+After picking a directory and then New or a saved session (or confirming a
+directory with no saved sessions), the picker message changes to one more step:
+**🛡 Normal**, **⚠️ Bypass**, or **Cancel**. The first message you sent is held
+until you choose.
+
+- **Normal** launches `CLAUDE_COMMAND` as before, so Claude follows your
+  settings and asks before risky actions.
+- **Bypass** adds `--dangerously-skip-permissions` (before `--resume` when
+  resuming). Every tool, including shell commands, then runs without a prompt.
+
+The confirmation message shows the chosen mode. The buttons carry a one-time
+token: a second tap, a button from an old picker, or a tap from another topic
+is rejected without starting anything. In a shared topic, only the person whose
+message opened the setup can select, start, or bind a session in the window,
+directory, session, and permission pickers; this applies even with owner
+locking off (the owner lock itself is unchanged). Any allowed user can tap
+Cancel, and a message from another allowed user in that topic discards the
+unfinished setup and starts a new one for them. Picker state is kept in memory, so buttons left over
+from before a bot restart are answered as expired. Cancel discards the held
+message.
+
+The mode is recorded per window in `state.json` as
+`window_states.<window_id>.skip_permissions` (only written when `true`) and is
+copied into recovery snapshots in `pending_recoveries`. `/recover` and startup
+recovery relaunch with the same mode. Only the `/recover` reply mentions Bypass
+mode; startup recovery restores it without a message. Binding an existing
+window through the window picker always records it as Normal, because CCBot
+cannot tell how that window was launched, so a later recovery of it starts in
+Normal. A window that survived a bot crash and is re-adopted by recovery is
+recorded with the current launch decision (the saved mode, or Normal when the
+flag is off), not with whatever it was originally started with.
+The fixed workspace never shows the picker and always starts in Normal.
+
+With the flag off, the extra step never appears and Bypass is never added,
+including during recovery. The flag is therefore a kill switch. A window that
+recovery relaunches while the flag is off is recorded as Normal, so turning the
+flag back on later does not bring Bypass back for that window. Windows that are
+not relaunched keep their saved value. Older CCBot versions ignore the field,
+so downgrading recovers every window in Normal mode.
+
+Things to know before enabling it:
+
+- Normal does not remove a permission flag that is already part of
+  `CLAUDE_COMMAND` (`--dangerously-skip-permissions`,
+  `--allow-dangerously-skip-permissions`, `--permission-mode`). CCBot logs a
+  warning at startup in that case.
+- Unless `skipDangerousModePermissionPrompt` is set in Claude's settings, Claude
+  shows a one-time "No, exit / Yes, I accept" warning on its first Bypass
+  launch. Text followed by Enter could select "No, exit", so CCBot does not
+  type into that warning. After a Bypass launch, the held first message is only
+  forwarded when the `SessionStart` hook confirmed startup and the pane shows no
+  warning. Otherwise CCBot asks you to resend it (and to answer the warning
+  with the controls shown in the topic, if it is visible). A later message sent
+  while the warning is on screen is not forwarded either. This check, and the
+  warning's controls in the topic, apply only to windows recorded as Bypass
+  while the flag is on; detection requires the dialog's own title and option
+  lines near the bottom of the pane, so Claude quoting the wording does not
+  trigger it. A recovery that times out on this warning says so in its error.
+- Claude refuses Bypass when it runs as root, and a managed
+  `disableBypassPermissionsMode` setting overrides the flag. In both cases the
+  session does not run in Bypass even though CCBot recorded it.
+- `/mode` shows the live mode from Claude's footer, which can change during the
+  session; the stored value is only the launch mode.
+- Anyone allowed to type in a Bypass topic can run commands without a prompt.
+  Enable `CCBOT_TOPIC_OWNER_LOCK` when several people share a group.
+
+The detection of Claude's Bypass warning is based on its documented wording and
+has not been checked against a live pane.
 
 ## Recovery after reboot
 
@@ -262,13 +338,17 @@ Regression tests cover cross-group routing, General-topic dispatch, ownership
 and callbacks, file boundaries and Telegram transport errors, hook installation,
 fixed-workspace creation and retry behavior, and keeping only the newest
 notification mention per topic (delete, edit fallback, late sends, concurrent
-hooks, retrying transient cleanup failures, and the opt-out flag). Recovery tests cover cold
+hooks, retrying transient cleanup failures, and the opt-out flag), and the
+permission mode step (flag off unchanged, Normal and Bypass launches, stale and
+foreign buttons, the held first message, persistence and recovery in the same
+mode). Recovery tests cover cold
 startup, bot crashes during launch, reused IDs, failed topics, and retained
 owners and offsets. An integration test uses a unique tmux socket and a fake
 Claude CLI that invokes the real hook, then destroys only that test server to
 simulate a reboot. Telegram transport is mocked; the suite does not send real
 messages or attachments. Live Claude resume and an actual VM reboot have not
-been exercised for this development update.
+been exercised for this development update, and Claude's one-time Bypass
+warning dialog has not been verified by hand.
 
 Ruff's original `E4`, `E7`, `E9`, and `F` rule selection is explicit in
 `pyproject.toml`, following the
